@@ -41,7 +41,7 @@
 use criome::transport::CriomeClient;
 use sema_engine::EntryDigest;
 
-use crate::schema::signal::{AdvanceRefusalReason, Output};
+use crate::schema::signal::{AdvanceRefusalReason, Response};
 use signal_criome::{
     AuthorizationRequestSlot, AuthorizationStateRecord, AuthorizationStatus, AuthorizedObjectKind,
     AuthorizedObjectReference, ComponentKind, Identity, ObjectDigest, ReplayNonce,
@@ -124,7 +124,7 @@ impl From<&LocalHeadCapture> for AuthorizedObjectReference {
 /// any head-advancing working operation is accepted, and carries the
 /// [`ClusterAuthorizer`] — an enabled gate always has a socket; a disabled
 /// gate never runs. A refused, expired, unavailable, or unreachable verdict
-/// refuses the OPERATION to the caller ([`Output::AdvanceRefused`]) and the
+/// refuses the OPERATION to the caller ([`Response::AdvanceRefused`]) and the
 /// staged group is discarded: nothing is recorded anywhere, fail-closed.
 /// Reads are unaffected.
 ///
@@ -378,7 +378,7 @@ pub enum GateDecision {
     /// so the caller materializes or ships exactly what was authorized.
     Authorized(AuthorizedObjectReference),
     /// criome reached a terminal verdict but did not authorize. Intake:
-    /// the operation is refused ([`Output::AdvanceRefused`]) and the staged
+    /// the operation is refused ([`Response::AdvanceRefused`]) and the staged
     /// group discarded — its digest names entries that will never exist, and
     /// criome's dead-round supersession admits a later differing successor.
     /// Ship drain: the suffix waits for the next mail.
@@ -443,7 +443,7 @@ impl From<GateRefusal> for AdvanceRefusalReason {
 pub struct StagedHeadAdvance {
     authorizer: ClusterAuthorizer,
     prospective_head: EntryDigest,
-    held_reply: Output,
+    held_reply: Response,
     verdict: Option<GateDecision>,
 }
 
@@ -451,7 +451,7 @@ impl StagedHeadAdvance {
     pub fn new(
         authorizer: ClusterAuthorizer,
         prospective_head: EntryDigest,
-        held_reply: Output,
+        held_reply: Response,
     ) -> Self {
         Self {
             authorizer,
@@ -467,7 +467,7 @@ impl StagedHeadAdvance {
     /// distinguish machinery from refusal and should not; the fault is
     /// logged loudly on the daemon side and judged `Unreachable`.
     pub async fn resolve(&mut self) {
-        let capture = LocalHeadCapture::spirit_head(self.prospective_head.clone());
+        let capture = LocalHeadCapture::spirit_head(self.prospective_head);
         let verdict = match self.authorizer.authorize_head(&capture).await {
             Ok(decision) => decision,
             Err(machinery_fault) => {
@@ -494,7 +494,7 @@ impl StagedHeadAdvance {
 
     /// Release the held accepted reply (the grant arrived and the group
     /// materialized — acceptance happened at the grant).
-    pub fn into_held_reply(self) -> Output {
+    pub fn into_held_reply(self) -> Response {
         self.held_reply
     }
 }

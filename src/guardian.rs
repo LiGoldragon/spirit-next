@@ -5,15 +5,11 @@ use std::{
     time::Duration,
 };
 
-use signal_frame::{
-    ExchangeFrameBody, ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, Request,
-    SessionEpoch, ShortHeader, SubReply,
-};
-use signal_spirit::SpiritGuardianAgentConfiguration;
 use signal_spirit_judge::{
     AdmissionJudgeOperation, AdmissionJudgePacket, AdmissionJudgeResponse, AdmissionJudgeVerdict,
-    AdmissionRejectionReason, JudgeDiagnostic, SpiritJudgeFrame, SpiritJudgeReply,
-    SpiritJudgeRequest, SpiritJudgeRequestRejection, SpiritJudgeRequestRejectionReason,
+    AdmissionRejectionReason, ByteViewable, JudgeDiagnostic, Query as JudgeQuery,
+    Response as JudgeResponse, Restorable, Signal, Signalizable, SpiritJudgeRequestRejection,
+    SpiritJudgeRequestRejectionReason,
 };
 use thiserror::Error;
 
@@ -27,7 +23,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentGuardianConfiguration {
     socket_path: PathBuf,
     timeout: Duration,
@@ -38,7 +34,7 @@ pub struct AgentGuardian {
     configuration: AgentGuardianConfiguration,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentGuardianRejection {
     reason: GuardianRejectionReason,
     records: RecordSet,
@@ -46,7 +42,7 @@ pub struct AgentGuardianRejection {
     database_marker: DatabaseMarker,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentGuardianDecision {
     verdict: GuardianVerdict,
     records: RecordSet,
@@ -70,13 +66,6 @@ impl AgentGuardianConfiguration {
     pub const LOCAL_OPENAI_COMPATIBLE_MODEL: &'static str = "gpt-5.4-mini";
     pub const LOCAL_OPENAI_COMPATIBLE_ENDPOINT: &'static str = "http://127.0.0.1:18080/v1";
     pub const DEFAULT_TIMEOUT_MILLISECONDS: u64 = 180_000;
-
-    pub fn from_contract(configuration: &SpiritGuardianAgentConfiguration) -> Self {
-        Self {
-            socket_path: PathBuf::from(configuration.agent_socket_path()),
-            timeout: Duration::from_millis(configuration.timeout_milliseconds()),
-        }
-    }
 
     pub fn new(
         socket_path: impl Into<PathBuf>,
@@ -129,16 +118,17 @@ impl AgentGuardian {
         records: RecordSet,
         database_marker: DatabaseMarker,
     ) -> AgentGuardianDecision {
-        let packet = AdmissionJudgePacket::new(
-            AdmissionJudgeOperationProjection::new(operation).into_contract(),
-            records.clone(),
-            database_marker.clone(),
-        );
-        let verdict = match self.call_judge(SpiritJudgeRequest::JudgeAdmission(packet)) {
-            Ok(SpiritJudgeReply::AdmissionJudged(response)) => {
+        let packet = AdmissionJudgePacket {
+            admission_judge_operation: AdmissionJudgeOperationProjection::new(operation)
+                .into_contract(),
+            record_set: records.clone(),
+            database_marker: database_marker.clone(),
+        };
+        let verdict = match self.call_judge(JudgeQuery::JudgeAdmission(packet)) {
+            Ok(JudgeResponse::AdmissionJudged(response)) => {
                 GuardianVerdict::from_admission_response(response)
             }
-            Ok(SpiritJudgeReply::RequestRejected(rejection)) => {
+            Ok(JudgeResponse::RequestRejected(rejection)) => {
                 GuardianVerdict::from_request_rejection(rejection)
             }
             Err(error) => GuardianVerdict::from_judge_error(error),
@@ -146,10 +136,7 @@ impl AgentGuardian {
         AgentGuardianDecision::new(verdict, records, database_marker)
     }
 
-    fn call_judge(
-        &self,
-        request: SpiritJudgeRequest,
-    ) -> Result<SpiritJudgeReply, AgentGuardianError> {
+    fn call_judge(&self, request: JudgeQuery) -> Result<JudgeResponse, AgentGuardianError> {
         let mut stream = UnixStream::connect(self.configuration.socket_path())
             .map_err(AgentGuardianError::Socket)?;
         stream
@@ -158,22 +145,20 @@ impl AgentGuardian {
         stream
             .set_write_timeout(Some(self.configuration.timeout()))
             .map_err(AgentGuardianError::Socket)?;
-        let frame = SpiritJudgeFrame::with_short_header(
-            ShortHeader::empty(),
-            ExchangeFrameBody::Request {
-                exchange: ClientExchange::first().identifier(),
-                request: Request::from_payload(request),
-            },
-        );
-        let bytes = frame
-            .encode_length_prefixed()
+        let signal = request
+            .signalize()
             .map_err(|error| AgentGuardianError::Frame(error.to_string()))?;
+        let bytes = signal.bytes();
+        let length = u32::try_from(bytes.len())
+            .map_err(|_| AgentGuardianError::Frame("judge signal exceeds u32 length".into()))?;
         stream
-            .write_all(bytes.as_slice())
+            .write_all(&length.to_be_bytes())
+            .map_err(AgentGuardianError::Socket)?;
+        stream
+            .write_all(bytes)
             .map_err(AgentGuardianError::Socket)?;
         stream.flush().map_err(AgentGuardianError::Socket)?;
-        let reply_frame = FrameReader::new(&mut stream).read_reply_frame()?;
-        ClientExchange::reply_from_frame(reply_frame)
+        FrameReader::new(&mut stream).read_reply_signal()
     }
 }
 
@@ -186,91 +171,19 @@ impl<'stream> FrameReader<'stream> {
         Self { stream }
     }
 
-    fn read_reply_frame(&mut self) -> Result<SpiritJudgeFrame, AgentGuardianError> {
+    fn read_reply_signal(&mut self) -> Result<JudgeResponse, AgentGuardianError> {
         let mut prefix = [0_u8; 4];
         self.stream
             .read_exact(&mut prefix)
             .map_err(AgentGuardianError::Socket)?;
         let length = u32::from_be_bytes(prefix) as usize;
-        let mut bytes = Vec::with_capacity(4 + length);
-        bytes.extend_from_slice(&prefix);
-        bytes.resize(4 + length, 0);
+        let mut bytes = vec![0; length];
         self.stream
-            .read_exact(&mut bytes[4..])
+            .read_exact(&mut bytes)
             .map_err(AgentGuardianError::Socket)?;
-        SpiritJudgeFrame::decode_length_prefixed(bytes.as_slice())
+        Signal::<JudgeResponse>::from(bytes)
+            .restore()
             .map_err(|error| AgentGuardianError::Frame(error.to_string()))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ClientExchange {
-    session_epoch: SessionEpoch,
-    sequence: LaneSequence,
-}
-
-impl ClientExchange {
-    fn first() -> Self {
-        Self {
-            session_epoch: SessionEpoch::new(1),
-            sequence: LaneSequence::first(),
-        }
-    }
-
-    fn identifier(&self) -> ExchangeIdentifier {
-        ExchangeIdentifier::new(self.session_epoch, ExchangeLane::Connector, self.sequence)
-    }
-
-    fn reply_from_frame(frame: SpiritJudgeFrame) -> Result<SpiritJudgeReply, AgentGuardianError> {
-        match frame.into_body() {
-            ExchangeFrameBody::Reply { reply, .. } => match reply {
-                Reply::Accepted { per_operation, .. } => {
-                    Ok(per_operation.into_head().representative_reply())
-                }
-                Reply::Rejected { reason } => Err(AgentGuardianError::Frame(reason.to_string())),
-            },
-            ExchangeFrameBody::HandshakeRequest(_) => {
-                Err(AgentGuardianError::WrongReply("handshake request"))
-            }
-            ExchangeFrameBody::HandshakeReply(_) => {
-                Err(AgentGuardianError::WrongReply("handshake reply"))
-            }
-            ExchangeFrameBody::Request { .. } => Err(AgentGuardianError::WrongReply("request")),
-        }
-    }
-}
-
-trait RepresentativeReply {
-    fn representative_reply(self) -> SpiritJudgeReply;
-}
-
-impl RepresentativeReply for SubReply<SpiritJudgeReply> {
-    fn representative_reply(self) -> SpiritJudgeReply {
-        match self {
-            Self::Ok(reply) => reply,
-            Self::Failed { detail, .. } => detail.unwrap_or_else(|| {
-                SpiritJudgeReply::RequestRejected(SpiritJudgeRequestRejection::new(
-                    SpiritJudgeRequestRejectionReason::InvalidRequest,
-                    JudgeDiagnostic::redacted(
-                        signal_spirit_judge::RedactedText::new(
-                            "spirit judge frame operation failed",
-                        )
-                        .expect("static diagnostic is non-empty"),
-                    ),
-                ))
-            }),
-            Self::Invalidated | Self::Skipped => {
-                SpiritJudgeReply::RequestRejected(SpiritJudgeRequestRejection::new(
-                    SpiritJudgeRequestRejectionReason::InvalidRequest,
-                    JudgeDiagnostic::redacted(
-                        signal_spirit_judge::RedactedText::new(
-                            "spirit judge frame operation produced no reply",
-                        )
-                        .expect("static diagnostic is non-empty"),
-                    ),
-                ))
-            }
-        }
     }
 }
 
@@ -287,10 +200,17 @@ impl<'operation> AdmissionJudgeOperationProjection<'operation> {
         match self.operation {
             GuardianOperation::Record(request) => AdmissionJudgeOperation::Record(request.clone()),
             GuardianOperation::Propose(proposal) => {
-                AdmissionJudgeOperation::Propose(proposal.clone())
+                AdmissionJudgeOperation::Propose(signal_spirit::RecordRequest {
+                    entry: proposal.entry.clone(),
+                    justification: proposal.justification.clone(),
+                })
             }
             GuardianOperation::Clarify(clarification) => {
-                AdmissionJudgeOperation::Clarify(clarification.clone())
+                AdmissionJudgeOperation::Clarify(signal_spirit::ClarificationRequest {
+                    record_identifier: clarification.record_identifier.clone(),
+                    description: clarification.description.clone(),
+                    justification: clarification.justification.clone(),
+                })
             }
             GuardianOperation::ResolveClarification(resolution) => {
                 AdmissionJudgeOperation::ResolveClarification(resolution.clone())
@@ -310,27 +230,31 @@ impl<'operation> AdmissionJudgeOperationProjection<'operation> {
 
 impl GuardianVerdict {
     fn from_admission_response(response: AdmissionJudgeResponse) -> Self {
-        match response.verdict {
+        match response.admission_judge_verdict {
             AdmissionJudgeVerdict::Accept => Self::Accept,
             AdmissionJudgeVerdict::Reject(reason) => Self::reject(Reject {
                 guardian_rejection_reason: AdmissionRejectionProjection::new(reason).into_signal(),
-                explanation: JudgeDiagnosticProjection::new(response.diagnostic).into_explanation(),
+                explanation: JudgeDiagnosticProjection::new(response.judge_diagnostic)
+                    .into_explanation(),
             }),
         }
     }
 
     fn from_request_rejection(rejection: SpiritJudgeRequestRejection) -> Self {
         Self::reject(Reject {
-            guardian_rejection_reason: RequestRejectionProjection::new(rejection.reason)
-                .to_guardian_reason(),
-            explanation: JudgeDiagnosticProjection::new(rejection.diagnostic).into_explanation(),
+            guardian_rejection_reason: RequestRejectionProjection::new(
+                rejection.spirit_judge_request_rejection_reason,
+            )
+            .to_guardian_reason(),
+            explanation: JudgeDiagnosticProjection::new(rejection.judge_diagnostic)
+                .into_explanation(),
         })
     }
 
     fn from_judge_error(error: AgentGuardianError) -> Self {
         Self::reject(Reject {
             guardian_rejection_reason: error.guardian_rejection_reason(),
-            explanation: Explanation::new(error.to_string()),
+            explanation: error.to_string(),
         })
     }
 }
@@ -346,7 +270,7 @@ impl JudgeDiagnosticProjection {
 
     fn into_explanation(self) -> Explanation {
         if self.diagnostic.content_hashes.is_empty() {
-            Explanation::new(self.diagnostic.redacted_text.as_str())
+            self.diagnostic.redacted_text.clone()
         } else {
             let hashes = self
                 .diagnostic
@@ -355,11 +279,7 @@ impl JudgeDiagnosticProjection {
                 .map(|hash| hash.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            Explanation::new(format!(
-                "{} [{}]",
-                self.diagnostic.redacted_text.as_str(),
-                hashes
-            ))
+            format!("{} [{}]", &self.diagnostic.redacted_text, hashes)
         }
     }
 }

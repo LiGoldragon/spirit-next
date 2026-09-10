@@ -4,11 +4,11 @@
 //! multi-listener binding, accepted-connection context, decode -> execute ->
 //! encode spine, emitted subscription registry + retained-writer publish
 //! wiring, and `ExitReport`-based entry) is emitted into
-//! `src/schema/daemon.rs` by schema-rust's daemon emitter. Spirit fills
+//! authored daemon runtime. Spirit fills
 //! only the record-1488 escape hatches through `impl ComponentDaemon for
 //! SpiritDaemon`: how to load its binary `Configuration`, how to open its
-//! Store/Engine (`build_runtime`), how one working `Input` becomes one
-//! `Output`, the owner-only meta request hook, and the stream filter + event
+//! Store/Engine (`build_runtime`), how one working `Query` becomes one
+//! `Response`, the owner-only meta request hook, and the stream filter + event
 //! policy.
 
 use thiserror::Error;
@@ -18,13 +18,15 @@ use triad_runtime::{
     LengthPrefixedCodec, ListenerError,
 };
 
+use meta_signal_spirit::{ByteViewable as _, Restorable as _, Signalizable as _};
+
 use crate::{
     Configuration, ConfigurationError, Engine, StoreError,
-    meta_transport::{MetaFrameError, MetaInput, MetaTransportError},
-    schema::daemon::{ComponentDaemon, DaemonBinder, DaemonError},
+    component_daemon::{ComponentDaemon, DaemonBinder, DaemonError},
+    meta_transport::MetaTransportError,
     schema::nexus::{EngineStartFailure, EngineStopFailure},
-    schema::signal::{Input, IntentEvent, Output, Query, SignalFrameError, short_header},
-    store::Store,
+    schema::signal::{IntentEvent, Query, Response},
+    store::{EntryStoreExt, Store},
     subscription::IntentSubscriptionToken,
     transport::TransportError,
 };
@@ -56,19 +58,13 @@ pub enum SpiritDaemonError {
     Listener(#[from] ListenerError),
 
     #[error("daemon signal frame error: {0}")]
-    SignalFrame(#[from] SignalFrameError),
-
-    #[error("daemon stream frame error: {0}")]
-    StreamFrame(#[from] signal_frame::FrameError),
+    Signal(String),
 
     #[error("daemon transport error: {0}")]
     Transport(#[from] TransportError),
 
     #[error("daemon meta transport error: {0}")]
     MetaTransport(#[from] MetaTransportError),
-
-    #[error("daemon meta frame error: {0}")]
-    MetaFrame(#[from] MetaFrameError),
 
     #[error("daemon sema store error: {0}")]
     Store(#[from] StoreError),
@@ -83,21 +79,37 @@ pub enum SpiritDaemonError {
     EngineRequest(#[from] EngineRequestError),
 }
 
+impl From<String> for SpiritDaemonError {
+    fn from(error: String) -> Self {
+        Self::Signal(error)
+    }
+}
+
 impl ComponentDaemon for SpiritDaemon {
     type Configuration = Configuration;
     type ConfigurationError = ConfigurationError;
     type Engine = Engine;
     type Error = SpiritDaemonError;
     type SubscriptionToken = IntentSubscriptionToken;
-    type SubscriptionFilter = Query;
+    type SubscriptionFilter = signal_spirit::Selection;
     type StreamEvent = IntentEvent;
 
-    const PROCESS_NAME: &'static str = "spirit-daemon";
+    const PROCESS_NAME: &'static str = "spirit-nexus";
 
-    fn load_configuration(
-        path: &std::path::Path,
-    ) -> Result<Self::Configuration, Self::ConfigurationError> {
-        Configuration::from_binary_path(path)
+    fn default_configuration() -> Result<Self::Configuration, Self::ConfigurationError> {
+        let database_path = Configuration::stable_database_path();
+        // Opening the stable store before listener binding both seeds a fresh
+        // Sema and recovers persisted desired configuration on restart. The
+        // running daemon retains this immutable active snapshot; Configure
+        // writes desired state for the next zero-argument start.
+        let state = Store::open_with_configuration(
+            &database_path,
+            Configuration::default_nexus_configuration(),
+        )
+        .map_err(|_| ConfigurationError::ArchiveDecode)?
+        .nexus_configuration_state()
+        .map_err(|_| ConfigurationError::ArchiveDecode)?;
+        Configuration::checked_from_raw_at_database(state.desired_configuration, database_path)
     }
 
     /// Open the engine and run its lifecycle start hooks. Engine startup needs
@@ -113,9 +125,7 @@ impl ComponentDaemon for SpiritDaemon {
             // The pushed `ComponentTraceEvent`s are stamped with this engine's
             // identity so introspect can key its store per emitter. The daemon
             // socket path uniquely identifies this running spirit instance.
-            let engine_identity = signal_persona::EngineIdentifier::new(
-                configuration.socket_path().to_string_lossy().into_owned(),
-            );
+            let engine_identity = configuration.socket_path().to_string_lossy().into_owned();
             let trace_log = configuration
                 .trace_socket_path()
                 .map(|path| TraceLog::socket(engine_identity.clone(), path))
@@ -131,7 +141,6 @@ impl ComponentDaemon for SpiritDaemon {
         #[cfg(feature = "agent-guardian")]
         if let Some(guardian) = configuration
             .guardian_agent_configuration()
-            .cloned()
             .map(crate::guardian::AgentGuardian::new)
         {
             engine.set_guardian(guardian);
@@ -164,9 +173,9 @@ impl ComponentDaemon for SpiritDaemon {
     /// after materialization.
     async fn handle_working_input(
         engine: &mut Self::Engine,
-        input: Input,
+        input: Query,
         _connection: &triad_runtime::ConnectionContext,
-    ) -> Result<Output, Self::Error> {
+    ) -> Result<Response, Self::Error> {
         Ok(engine.handle_async(input).await.root().clone())
     }
 
@@ -178,31 +187,34 @@ impl ComponentDaemon for SpiritDaemon {
     /// `ApplyAuthorizedRecord` is NOT intake-gated: it carries an
     /// authorization that already happened (§4) and today answers
     /// fail-closed without a write. The match is exhaustive on purpose: a
-    /// new Input variant must choose its lane here before spirit compiles.
+    /// new Query variant must choose its lane here before spirit compiles.
     #[cfg(feature = "criome-gate")]
-    fn working_input_lane(input: &Input) -> crate::schema::daemon::WorkingInputLane {
+    fn working_input_lane(input: &Query) -> crate::component_daemon::WorkingQueryLane {
         match input {
-            Input::State(_)
-            | Input::Record(_)
-            | Input::Propose(_)
-            | Input::Clarify(_)
-            | Input::ResolveClarification(_)
-            | Input::Supersede(_)
-            | Input::Retire(_)
-            | Input::BumpImportance(_)
-            | Input::ChangeRecord(_) => crate::schema::daemon::WorkingInputLane::Staged,
-            Input::Observe(_)
-            | Input::Intent(_)
-            | Input::TextSearch(_)
-            | Input::Lookup(_)
-            | Input::Count(_)
-            | Input::LookupStash(_)
-            | Input::Tap(_)
-            | Input::Untap(_)
-            | Input::SubscribeIntent(_)
-            | Input::Version
-            | Input::Marker
-            | Input::ApplyAuthorizedRecord(_) => crate::schema::daemon::WorkingInputLane::Immediate,
+            Query::Configure(_)
+            | Query::State(_)
+            | Query::Record(_)
+            | Query::Propose(_)
+            | Query::Clarify(_)
+            | Query::ResolveClarification(_)
+            | Query::Supersede(_)
+            | Query::Retire(_)
+            | Query::BumpImportance(_)
+            | Query::ChangeRecord(_) => crate::component_daemon::WorkingQueryLane::Staged,
+            Query::Observe(_)
+            | Query::Intent(_)
+            | Query::TextSearch(_)
+            | Query::Lookup(_)
+            | Query::Count(_)
+            | Query::LookupStash(_)
+            | Query::Tap(_)
+            | Query::Untap(_)
+            | Query::SubscribeIntent(_)
+            | Query::Version
+            | Query::Marker
+            | Query::ApplyAuthorizedRecord(_) => {
+                crate::component_daemon::WorkingQueryLane::Immediate
+            }
         }
     }
 
@@ -212,15 +224,15 @@ impl ComponentDaemon for SpiritDaemon {
     #[cfg(feature = "criome-gate")]
     async fn stage_working_input(
         engine: &mut Self::Engine,
-        input: Input,
+        input: Query,
         _connection: &triad_runtime::ConnectionContext,
-    ) -> Result<crate::schema::daemon::StagedWorkingTurn<Self>, Self::Error> {
+    ) -> Result<crate::component_daemon::StagedWorkingTurn<Self>, Self::Error> {
         Ok(match engine.stage_working_input(input).await {
             crate::engine::StagedIntake::Completed(output) => {
-                crate::schema::daemon::StagedWorkingTurn::Completed(output)
+                crate::component_daemon::StagedWorkingTurn::Completed(output)
             }
             crate::engine::StagedIntake::Parked(advance) => {
-                crate::schema::daemon::StagedWorkingTurn::Awaiting(Box::new(advance))
+                crate::component_daemon::StagedWorkingTurn::Awaiting(Box::new(advance))
             }
         })
     }
@@ -235,9 +247,9 @@ impl ComponentDaemon for SpiritDaemon {
         Some(engine.advance_gate())
     }
 
-    /// Serve one owner-only meta request: decode a `Configure` meta `Input`,
+    /// Serve one owner-only meta request: decode a `Configure` meta `Query`,
     /// apply it through `Engine::configure` (a configuration effect, not a SEMA
-    /// log write), and write the `Configured` / `Rejected` meta `Output` back.
+    /// log write), and write the `Configured` / `Rejected` meta `Response` back.
     /// `Configure` is request/reply, not a stream — no subscription handling.
     async fn handle_meta_connection(
         engine: &mut Self::Engine,
@@ -247,17 +259,30 @@ impl ComponentDaemon for SpiritDaemon {
             .read_body_async(connection.stream_mut())
             .await?
             .into_bytes();
-        let (_route, input) = MetaInput::decode_signal_frame(&frame)?;
+        let input = meta_signal_spirit::Signal::<meta_signal_spirit::Query>::from(frame)
+            .restore()
+            .map_err(|error| SpiritDaemonError::Signal(error.to_string()))?;
         let reply = match input {
-            MetaInput::Configure(request) => engine.configure_async(request.into_payload()).await,
-            MetaInput::Import(request) => engine.import_async(request.into_payload()).await,
-            MetaInput::ObserveHead => engine.observe_head_async().await,
-            MetaInput::ObserveHeadObject => engine.observe_head_object_async().await,
+            meta_signal_spirit::Query::Configure(request) => engine.configure_async(request).await,
+            meta_signal_spirit::Query::ReverseMetaConfiguration => {
+                engine.reverse_meta_configuration_async().await
+            }
+            meta_signal_spirit::Query::Import(request) => engine.import_async(request).await,
+            meta_signal_spirit::Query::ObserveHead => engine.observe_head_async().await,
+            meta_signal_spirit::Query::ObserveHeadObject => {
+                engine.observe_head_object_async().await
+            }
         };
         LengthPrefixedCodec::default()
             .write_body_async(
                 connection.stream_mut(),
-                &LengthPrefixedFrameBody::new(reply.encode_signal_frame()?),
+                &LengthPrefixedFrameBody::new(
+                    reply
+                        .signalize()
+                        .map_err(|error| SpiritDaemonError::Signal(error.to_string()))?
+                        .bytes()
+                        .to_vec(),
+                ),
             )
             .await?;
         connection
@@ -268,71 +293,70 @@ impl ComponentDaemon for SpiritDaemon {
         Ok(())
     }
 
-    fn subscription_filter(input: &Input) -> Option<Self::SubscriptionFilter> {
+    fn subscription_filter(input: &Query) -> Option<Self::SubscriptionFilter> {
         match input {
-            Input::SubscribeIntent(query) => Some(query.payload().clone()),
-            Input::State(_)
-            | Input::Record(_)
-            | Input::Propose(_)
-            | Input::Clarify(_)
-            | Input::ResolveClarification(_)
-            | Input::Supersede(_)
-            | Input::Retire(_)
-            | Input::Observe(_)
-            | Input::Intent(_)
-            | Input::TextSearch(_)
-            | Input::Lookup(_)
-            | Input::Count(_)
-            | Input::BumpImportance(_)
-            | Input::ChangeRecord(_)
-            | Input::LookupStash(_)
-            | Input::Tap(_)
-            | Input::Untap(_)
-            | Input::Version
-            | Input::ApplyAuthorizedRecord(_)
-            | Input::Marker => None,
+            Query::SubscribeIntent(query) => Some(query.clone()),
+            Query::Configure(_)
+            | Query::State(_)
+            | Query::Record(_)
+            | Query::Propose(_)
+            | Query::Clarify(_)
+            | Query::ResolveClarification(_)
+            | Query::Supersede(_)
+            | Query::Retire(_)
+            | Query::Observe(_)
+            | Query::Intent(_)
+            | Query::TextSearch(_)
+            | Query::Lookup(_)
+            | Query::Count(_)
+            | Query::BumpImportance(_)
+            | Query::ChangeRecord(_)
+            | Query::LookupStash(_)
+            | Query::Tap(_)
+            | Query::Untap(_)
+            | Query::Version
+            | Query::ApplyAuthorizedRecord(_)
+            | Query::Marker => None,
         }
     }
 
-    fn subscription_token(output: &Output) -> Option<Self::SubscriptionToken> {
+    fn subscription_token(output: &Response) -> Option<Self::SubscriptionToken> {
         match output {
-            Output::SubscriptionStarted(subscription) => {
-                Some(IntentSubscriptionToken::from_signal_token(
-                    subscription.payload().payload().clone(),
-                ))
-            }
+            Response::SubscriptionStarted(subscription) => Some(
+                IntentSubscriptionToken::from_signal_token(subscription.subscription_token),
+            ),
             _ => None,
         }
     }
 
     async fn published_event(
         engine: &Self::Engine,
-        output: &Output,
+        output: &Response,
     ) -> Result<Option<Self::StreamEvent>, Self::Error> {
         match output {
-            Output::RecordAccepted(record_identifier) => Ok(engine
-                .intent_recorded_event_async(record_identifier.payload())
+            Response::RecordAccepted(record_identifier) => Ok(engine
+                .intent_recorded_event_async(record_identifier)
                 .await?),
-            Output::Proposed(record_identifier) => Ok(engine
-                .intent_recorded_event_async(record_identifier.payload())
+            Response::Proposed(record_identifier) => Ok(engine
+                .intent_recorded_event_async(record_identifier)
                 .await?),
-            Output::Clarified(receipt) => Ok(engine
-                .intent_clarified_event_async(receipt.payload())
-                .await?),
-            Output::Superseded(receipt) => Ok(engine
-                .intent_superseded_event_async(receipt.payload())
-                .await?),
-            Output::Retired(receipt) => Ok(Some(engine.intent_retired_event(receipt.payload()))),
+            Response::Clarified(receipt) => {
+                Ok(engine.intent_clarified_event_async(receipt).await?)
+            }
+            Response::Superseded(receipt) => {
+                Ok(engine.intent_superseded_event_async(receipt).await?)
+            }
+            Response::Retired(receipt) => Ok(Some(engine.intent_retired_event(receipt))),
             _ => Ok(None),
         }
     }
 
     fn event_matches_filter(filter: &Self::SubscriptionFilter, event: &Self::StreamEvent) -> bool {
-        filter.matches_intent_event(event)
-    }
-
-    fn subscription_event_short_header() -> u64 {
-        short_header::OUTPUT_EVENT
+        match event {
+            IntentEvent::IntentRecorded(recorded) => recorded.entry.matches(filter),
+            IntentEvent::IntentClarified(clarified) => clarified.entry.matches(filter),
+            IntentEvent::IntentSuperseded(_) | IntentEvent::IntentRetired(_) => false,
+        }
     }
 }
 
@@ -341,7 +365,9 @@ impl ComponentDaemon for SpiritDaemon {
 /// the engine mailbox keeps serving reads; `conclude` is one fast engine
 /// turn that materializes on the grant or discards on any other verdict.
 #[cfg(feature = "criome-gate")]
-impl crate::schema::daemon::StagedAdvance<SpiritDaemon> for crate::criome_gate::StagedHeadAdvance {
+impl crate::component_daemon::StagedAdvance<SpiritDaemon>
+    for crate::criome_gate::StagedHeadAdvance
+{
     fn resolve<'advance>(
         &'advance mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'advance>> {
@@ -352,7 +378,7 @@ impl crate::schema::daemon::StagedAdvance<SpiritDaemon> for crate::criome_gate::
         self: Box<Self>,
         engine: &'engine mut Engine,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Output, SpiritDaemonError>> + Send + 'engine>,
+        Box<dyn std::future::Future<Output = Result<Response, SpiritDaemonError>> + Send + 'engine>,
     > {
         Box::pin(async move { Ok(engine.conclude_staged_advance(*self).await) })
     }

@@ -23,16 +23,12 @@
 //!     and body are consistent by construction: re-hashing the body the witness
 //!     lands reproduces the head the witness forwards.
 
-#![cfg(feature = "nota-text")]
-
+use meta_signal_spirit::{ImportReceipt, ImportRequest, ImportedRecord, Response as MetaResponse};
 use sema_engine::VersionedCommitLogEntry;
-use spirit::schema::meta_signal::{Input as MetaInput, Output as MetaOutput};
+use signal_domain::{Domain, ProgrammingLeaf, SoftwareDomain, TechnologyDomain};
+use signal_spirit::{Entry, Kind, Magnitude};
 use spirit::{Engine, Store};
 use tempfile::TempDir;
-
-/// The EXACT owner-only meta `Import` the criome-auth witness sends to seed
-/// node-a's spirit daemon (mkCriomeAuthWitnessTest `importNota`).
-const WITNESS_IMPORT_NOTA: &str = "(Import [(witness-record-1 ([(Technology (Software (Programming CodeGeneration)))] Decision [criome auth witness record] Low))])";
 
 fn open_engine() -> (TempDir, Engine) {
     let directory = tempfile::tempdir().expect("create sandbox");
@@ -40,46 +36,45 @@ fn open_engine() -> (TempDir, Engine) {
     (directory, Engine::new(store))
 }
 
-/// Seed the witness's exact record through the meta `Import` path.
+/// Seed the witness record through the current typed meta `Import` path.
 fn seed_witness_record(engine: &mut Engine) {
-    let MetaInput::Import(import) = WITNESS_IMPORT_NOTA
-        .parse::<MetaInput>()
-        .expect("parse witness import NOTA")
-    else {
-        panic!("witness NOTA must be an Import");
-    };
-    let receipt = engine.import(import.into_payload());
-    assert!(
-        matches!(receipt, MetaOutput::Imported(_)),
-        "meta Import must seed the record, got {receipt:?}"
-    );
+    let receipt = engine.import(ImportRequest {
+        imported_records: vec![ImportedRecord {
+            record_identifier: "witness-record-1".into(),
+            entry: Entry {
+                domains: vec![Domain::Technology(TechnologyDomain::Software(
+                    SoftwareDomain::Programming(ProgrammingLeaf::CodeGeneration),
+                ))],
+                kind: Kind::Decision,
+                description: "criome auth witness record".into(),
+                importance: Magnitude::Low,
+            },
+        }],
+    });
+    assert!(matches!(
+        receipt,
+        MetaResponse::Imported(ImportReceipt {
+            record_count: 1,
+            ..
+        })
+    ));
 }
 
 /// The lowercase-hex head body carried by an `ObserveHeadObject` reply, or
 /// `None` when the store has no versioned-log head yet.
 fn observed_head_object_hex(engine: &Engine) -> Option<String> {
-    let MetaOutput::HeadObjectObserved(observed) = engine.observe_head_object() else {
+    let MetaResponse::HeadObjectObserved(observed) = engine.observe_head_object() else {
         panic!("ObserveHeadObject must reply HeadObjectObserved");
     };
-    observed
-        .payload()
-        .selected_head_object
-        .payload()
-        .as_ref()
-        .map(|object| object.payload().clone())
+    observed.selected_head_object
 }
 
 /// The lowercase-hex head DIGEST carried by an `ObserveHead` reply.
 fn observed_head_digest_hex(engine: &Engine) -> Option<String> {
-    let MetaOutput::HeadObserved(observed) = engine.observe_head() else {
+    let MetaResponse::HeadObserved(observed) = engine.observe_head() else {
         panic!("ObserveHead must reply HeadObserved");
     };
-    observed
-        .payload()
-        .selected_head_digest
-        .payload()
-        .as_ref()
-        .map(|digest| digest.payload().clone())
+    observed.selected_head_digest
 }
 
 /// Decode an even-length lowercase-hex string into its octets — the exact

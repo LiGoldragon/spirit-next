@@ -14,9 +14,8 @@
 mod support;
 
 use spirit::schema::signal::{
-    Description, DomainMatch, Entry, ImportanceSelection, Input, Justification, Kind, Magnitude,
-    ObserverFilter, OperationKind, Output, Query, QuoteText, Reasoning, RecordRequest,
-    SelectedKind, Testimony, VerbatimQuote,
+    DomainMatch, Entry, ImportanceSelection, Justification, Kind, Magnitude, ObserverFilter,
+    OperationKind, Query, RecordRequest, Response, Selection, VerbatimQuote,
 };
 use spirit::{Engine, Store};
 use support::domain_fixtures;
@@ -26,8 +25,8 @@ fn entry(description: &str) -> Entry {
     Entry {
         domains: domain_fixtures::domains(&["observer-tap"]),
         kind: Kind::Decision,
-        description: Description::new(description),
-        importance: Magnitude::Minimum.into(),
+        description: description.into(),
+        importance: Magnitude::Minimum,
     }
 }
 
@@ -35,22 +34,22 @@ fn record_request(description: &str) -> RecordRequest {
     RecordRequest {
         entry: entry(description),
         justification: Justification {
-            testimony: Testimony::new(vec![VerbatimQuote::new(
-                QuoteText::new(description.to_owned()),
-                None,
-            )]),
-            reasoning: Reasoning::new(description.to_owned()),
+            testimony: vec![VerbatimQuote {
+                quote_text: description.into(),
+                optional_antecedent: None,
+            }],
+            reasoning: description.into(),
         },
     }
 }
 
-fn observe_query() -> Query {
-    Query {
-        domain_match: DomainMatch::full(domain_fixtures::scopes(&["observer-tap"])),
+fn observe_query() -> Selection {
+    Selection {
+        domain_match: DomainMatch::Full(domain_fixtures::scopes(&["observer-tap"])),
         keyword_match: spirit::schema::signal::KeywordMatch::Any,
         text_match: spirit::schema::signal::TextMatch::Any,
-        selected_kind: SelectedKind::new(Some(Kind::Decision)),
-        importance_selection: ImportanceSelection::default_observation_importance(),
+        selected_kind: Some(Kind::Decision),
+        importance_selection: ImportanceSelection::Any,
     }
 }
 
@@ -69,24 +68,24 @@ fn tap_starts_at_the_current_revision_without_replaying_inactive_history() {
     // No tap exists, so this daemon-lifetime traffic has no consumer and must
     // not become replay history for a later tap.
     let _ = engine
-        .handle(Input::record(record_request("first intent")))
+        .handle(Query::Record(record_request("first intent")))
         .into_root();
     let _ = engine
-        .handle(Input::record(record_request("second intent")))
+        .handle(Query::Record(record_request("second intent")))
         .into_root();
-    let _ = engine.handle(Input::observe(observe_query())).into_root();
+    let _ = engine.handle(Query::Observe(observe_query())).into_root();
     assert_eq!(
         engine.observer_tap_table().retained_operation_count(),
         0,
         "operations without a tap retain no observer history"
     );
 
-    let reply = engine.handle(Input::tap(ObserverFilter::All)).into_root();
-    let Output::ObservationTapped(subscription) = reply else {
+    let reply = engine.handle(Query::Tap(ObserverFilter::All)).into_root();
+    let Response::ObservationTapped(subscription) = reply else {
         panic!("expected ObservationTapped, got {reply:?}")
     };
     assert!(
-        *subscription.subscription_token.payload() >= 1,
+        subscription.subscription_token >= 1,
         "the tap minted a subscription token"
     );
     assert_eq!(
@@ -100,18 +99,18 @@ fn tap_starts_at_the_current_revision_without_replaying_inactive_history() {
     );
 
     let _ = engine
-        .handle(Input::record(record_request("observed after tap")))
+        .handle(Query::Record(record_request("observed after tap")))
         .into_root();
     let untapped = engine
-        .handle(Input::untap(subscription.subscription_token.clone()))
+        .handle(Query::Untap(subscription.subscription_token))
         .into_root();
-    let Output::ObservationUntapped(retraction) = untapped else {
+    let Response::ObservationUntapped(retraction) = untapped else {
         panic!("expected ObservationUntapped, got {untapped:?}")
     };
     let kinds: Vec<OperationKind> = retraction
         .observed_operations
         .iter()
-        .map(|operation| *operation.payload())
+        .map(|operation| operation.operation_kind.clone())
         .collect();
     assert_eq!(
         kinds,
@@ -130,7 +129,7 @@ fn observer_retention_is_bounded_by_active_tap_lag() {
     let (_temp, mut engine) = engine();
 
     for _ in 0..1024 {
-        let _ = engine.handle(Input::Version).into_root();
+        let _ = engine.handle(Query::Version).into_root();
     }
     assert_eq!(
         engine.observer_tap_table().retained_operation_count(),
@@ -138,12 +137,12 @@ fn observer_retention_is_bounded_by_active_tap_lag() {
         "high-volume traffic without taps retains no operation history"
     );
 
-    let first = engine.handle(Input::tap(ObserverFilter::All)).into_root();
-    let Output::ObservationTapped(first) = first else {
+    let first = engine.handle(Query::Tap(ObserverFilter::All)).into_root();
+    let Response::ObservationTapped(first) = first else {
         panic!("expected first ObservationTapped, got {first:?}")
     };
     for _ in 0..1024 {
-        let _ = engine.handle(Input::Version).into_root();
+        let _ = engine.handle(Query::Version).into_root();
     }
     assert_eq!(
         engine.observer_tap_table().retained_operation_count(),
@@ -151,18 +150,18 @@ fn observer_retention_is_bounded_by_active_tap_lag() {
         "the first tap retains exactly its outstanding operation lag"
     );
 
-    let second = engine.handle(Input::tap(ObserverFilter::All)).into_root();
-    let Output::ObservationTapped(second) = second else {
+    let second = engine.handle(Query::Tap(ObserverFilter::All)).into_root();
+    let Response::ObservationTapped(second) = second else {
         panic!("expected second ObservationTapped, got {second:?}")
     };
     for _ in 0..128 {
-        let _ = engine.handle(Input::Version).into_root();
+        let _ = engine.handle(Query::Version).into_root();
     }
 
     let first_retraction = engine
-        .handle(Input::untap(first.subscription_token.clone()))
+        .handle(Query::Untap(first.subscription_token))
         .into_root();
-    let Output::ObservationUntapped(first_retraction) = first_retraction else {
+    let Response::ObservationUntapped(first_retraction) = first_retraction else {
         panic!("expected first ObservationUntapped, got {first_retraction:?}")
     };
     assert_eq!(
@@ -177,9 +176,9 @@ fn observer_retention_is_bounded_by_active_tap_lag() {
     );
 
     let second_retraction = engine
-        .handle(Input::untap(second.subscription_token.clone()))
+        .handle(Query::Untap(second.subscription_token))
         .into_root();
-    let Output::ObservationUntapped(second_retraction) = second_retraction else {
+    let Response::ObservationUntapped(second_retraction) = second_retraction else {
         panic!("expected second ObservationUntapped, got {second_retraction:?}")
     };
     assert_eq!(
@@ -199,18 +198,18 @@ fn untap_retires_the_subscription_and_returns_its_observations() {
     let (_temp, mut engine) = engine();
 
     let _ = engine
-        .handle(Input::record(record_request("intent")))
+        .handle(Query::Record(record_request("intent")))
         .into_root();
     let tapped = engine
-        .handle(Input::tap(ObserverFilter::OperationsOnly))
+        .handle(Query::Tap(ObserverFilter::OperationsOnly))
         .into_root();
-    let Output::ObservationTapped(subscription) = tapped else {
+    let Response::ObservationTapped(subscription) = tapped else {
         panic!("expected ObservationTapped, got {tapped:?}")
     };
-    let token = subscription.subscription_token.clone();
+    let token = subscription.subscription_token;
 
-    let untapped = engine.handle(Input::untap(token.clone())).into_root();
-    let Output::ObservationUntapped(retraction) = untapped else {
+    let untapped = engine.handle(Query::Untap(token)).into_root();
+    let Response::ObservationUntapped(retraction) = untapped else {
         panic!("expected ObservationUntapped, got {untapped:?}")
     };
     assert_eq!(
@@ -220,8 +219,8 @@ fn untap_retires_the_subscription_and_returns_its_observations() {
 
     // Untapping the same token again returns an empty observation set, proving
     // the subscription was retired.
-    let again = engine.handle(Input::untap(token)).into_root();
-    let Output::ObservationUntapped(retraction_again) = again else {
+    let again = engine.handle(Query::Untap(token)).into_root();
+    let Response::ObservationUntapped(retraction_again) = again else {
         panic!("expected ObservationUntapped, got {again:?}")
     };
     assert!(
@@ -235,15 +234,15 @@ fn effects_only_filter_observes_no_operations() {
     let (_temp, mut engine) = engine();
 
     let _ = engine
-        .handle(Input::record(record_request("intent")))
+        .handle(Query::Record(record_request("intent")))
         .into_root();
 
     // `EffectsOnly` observes effect events, not operations, so an operation-only
     // log yields an empty observation set under this filter.
     let reply = engine
-        .handle(Input::tap(ObserverFilter::EffectsOnly))
+        .handle(Query::Tap(ObserverFilter::EffectsOnly))
         .into_root();
-    let Output::ObservationTapped(subscription) = reply else {
+    let Response::ObservationTapped(subscription) = reply else {
         panic!("expected ObservationTapped, got {reply:?}")
     };
     assert!(

@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
-use spirit::{SignalTransport, schema::signal::Input};
+use signal_spirit::{Restorable as _, Signal};
+use spirit::{SignalTransport, schema::signal::Query};
 use triad_runtime::{FrameBody, LengthPrefixedCodec};
 
 #[test]
@@ -37,7 +38,7 @@ fn generated_input_decoder_rejects_raw_nota_text_directly() {
         b"(Record (([(Technology (Software (Intelligence AgentSystems)))] Decision [text must not be signal frame] Maximum Minimum Zero []) ([text must not be signal frame] None)))";
 
     assert!(
-        Input::decode_signal_frame(nota).is_err(),
+        Signal::<Query>::from(nota.to_vec()).restore().is_err(),
         "schema-emitted binary decoder must reject raw NOTA text"
     );
 }

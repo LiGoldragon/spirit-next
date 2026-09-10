@@ -10,19 +10,17 @@ use std::{
     time::Duration,
 };
 
-use signal_frame::{ExchangeFrameBody, NonEmpty, Reply, ShortHeader, SubReply};
 use signal_spirit_judge::{
-    AdmissionJudgeOperation, AdmissionJudgeResponse, AdmissionJudgeVerdict, JudgeDiagnostic,
-    RedactedText, SpiritJudgeFrame, SpiritJudgeReply, SpiritJudgeRequest,
+    AdmissionJudgeOperation, AdmissionJudgeResponse, AdmissionJudgeVerdict, ByteViewable,
+    JudgeDiagnostic, Query as SpiritJudgeQuery, Response as SpiritJudgeResponse, Restorable,
+    Signal, Signalizable,
 };
 use spirit::{
     AgentGuardian, AgentGuardianConfiguration, Engine, Store,
     schema::signal::{
-        Clarification, ClarificationRecordIdentifier, ClarificationResolution, Description,
-        Domains, Entry, GuardianRejectionReason, Importance, Input, Justification, Kind, Magnitude,
-        Output, Proposal, QuoteText, Reasoning, RecordChange, RecordIdentifier, RecordRequest,
-        Replacements, RetiredIdentifier, RetiredIdentifiers, Retirement, Supersession,
-        TargetClarification, TargetClarifications, Testimony, VerbatimQuote,
+        ClarificationRequest, ClarificationResolution, Entry, GuardianRejectionReason,
+        Justification, Kind, Magnitude, Proposal, Query, RecordChange, RecordIdentifier,
+        RecordRequest, Response, Retirement, Supersession, TargetClarification, VerbatimQuote,
     },
 };
 use tempfile::TempDir;
@@ -31,7 +29,7 @@ use support::domain_fixtures;
 
 struct FakeSpiritJudge {
     directory: TempDir,
-    captured_requests: Arc<Mutex<Vec<SpiritJudgeRequest>>>,
+    captured_requests: Arc<Mutex<Vec<SpiritJudgeQuery>>>,
     thread: thread::JoinHandle<()>,
 }
 
@@ -49,36 +47,23 @@ impl FakeSpiritJudge {
         let thread = thread::spawn(move || {
             for _ in 0..request_count {
                 let (mut stream, _) = listener.accept().expect("accept judge request");
-                let frame = FrameIo::new(&mut stream).read_frame();
-                let ExchangeFrameBody::Request { exchange, request } = frame.into_body() else {
-                    panic!("expected judge request frame");
-                };
-                let request_payload = request.payloads().head().clone();
+                let request_payload = SpiritJudgeSignalFrame::new(&mut stream).read_query();
                 thread_requests
                     .lock()
                     .expect("capture request")
                     .push(request_payload.clone());
                 let reply = match request_payload {
-                    SpiritJudgeRequest::JudgeAdmission(_) => {
-                        SpiritJudgeReply::AdmissionJudged(AdmissionJudgeResponse::new(
-                            AdmissionJudgeVerdict::Accept,
-                            JudgeDiagnostic::redacted(
-                                RedactedText::new("accepted").expect("static diagnostic"),
-                            ),
-                        ))
+                    SpiritJudgeQuery::JudgeAdmission(_) => {
+                        SpiritJudgeResponse::AdmissionJudged(AdmissionJudgeResponse {
+                            admission_judge_verdict: AdmissionJudgeVerdict::Accept,
+                            judge_diagnostic: JudgeDiagnostic {
+                                redacted_text: "accepted".into(),
+                                content_hashes: vec![],
+                            },
+                        })
                     }
                 };
-                let frame = SpiritJudgeFrame::with_short_header(
-                    ShortHeader::empty(),
-                    ExchangeFrameBody::Reply {
-                        exchange,
-                        reply: Reply::committed(
-                            NonEmpty::try_from_vec(vec![SubReply::Ok(reply)])
-                                .expect("reply list is non-empty"),
-                        ),
-                    },
-                );
-                FrameIo::new(&mut stream).write_frame(&frame);
+                SpiritJudgeSignalFrame::new(&mut stream).write_response(&reply);
             }
         });
         Self {
@@ -98,7 +83,7 @@ impl FakeSpiritJudge {
         ))
     }
 
-    fn join(self) -> Vec<SpiritJudgeRequest> {
+    fn join(self) -> Vec<SpiritJudgeQuery> {
         self.thread.join().expect("fake judge joins");
         self.captured_requests
             .lock()
@@ -107,32 +92,35 @@ impl FakeSpiritJudge {
     }
 }
 
-struct FrameIo<'stream> {
+struct SpiritJudgeSignalFrame<'stream> {
     stream: &'stream mut UnixStream,
 }
 
-impl<'stream> FrameIo<'stream> {
+impl<'stream> SpiritJudgeSignalFrame<'stream> {
     fn new(stream: &'stream mut UnixStream) -> Self {
         Self { stream }
     }
-
-    fn read_frame(&mut self) -> SpiritJudgeFrame {
+    fn read_query(&mut self) -> SpiritJudgeQuery {
         let mut prefix = [0_u8; 4];
         self.stream.read_exact(&mut prefix).expect("read prefix");
-        let length = u32::from_be_bytes(prefix) as usize;
-        let mut bytes = Vec::with_capacity(4 + length);
-        bytes.extend_from_slice(&prefix);
-        bytes.resize(4 + length, 0);
-        self.stream.read_exact(&mut bytes[4..]).expect("read body");
-        SpiritJudgeFrame::decode_length_prefixed(bytes.as_slice()).expect("decode frame")
+        let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize];
+        self.stream.read_exact(&mut bytes).expect("read body");
+        Signal::<SpiritJudgeQuery>::from(bytes)
+            .restore()
+            .expect("restore judge query")
     }
-
-    fn write_frame(&mut self, frame: &SpiritJudgeFrame) {
-        let bytes = frame.encode_length_prefixed().expect("encode frame");
+    fn write_response(&mut self, response: &SpiritJudgeResponse) {
+        let signal = response.signalize().expect("archive judge response");
+        let bytes = signal.bytes();
         self.stream
-            .write_all(bytes.as_slice())
-            .expect("write frame");
-        self.stream.flush().expect("flush frame");
+            .write_all(
+                &u32::try_from(bytes.len())
+                    .expect("u32 frame length")
+                    .to_be_bytes(),
+            )
+            .expect("write prefix");
+        self.stream.write_all(bytes).expect("write body");
+        self.stream.flush().expect("flush response");
     }
 }
 
@@ -143,24 +131,24 @@ fn daemon_admission_sends_one_typed_spirit_judge_request() {
     let mut engine = Engine::new(Store::open(database.path().join("intent.sema")).expect("store"));
     engine.set_guardian(judge.guardian());
 
-    let output = engine.handle(Input::record(record_request(entry(
+    let output = engine.handle(Query::Record(record_request(entry(
         "typed judge request crosses the daemon boundary",
     ))));
 
     assert!(
-        matches!(output.root(), Output::RecordAccepted(_)),
+        matches!(output.root(), Response::RecordAccepted(_)),
         "expected record accepted, got {:?}",
         output.root()
     );
     let requests = judge.join();
-    let Some(SpiritJudgeRequest::JudgeAdmission(packet)) = requests.first() else {
+    let Some(SpiritJudgeQuery::JudgeAdmission(packet)) = requests.first() else {
         panic!("expected one admission judge request: {requests:?}");
     };
     assert!(matches!(
-        packet.operation,
+        packet.admission_judge_operation,
         signal_spirit_judge::AdmissionJudgeOperation::Record(_)
     ));
-    assert!(packet.records.payload().is_empty());
+    assert!(packet.record_set.is_empty());
 }
 
 #[test]
@@ -175,20 +163,20 @@ fn required_guardian_rejects_proposal_when_judge_is_unconfigured() {
     )));
 
     match output.root() {
-        Output::GuardianRejected(rejection) => {
+        Response::GuardianRejected(rejection) => {
             assert_eq!(
-                rejection.payload().guardian_rejection_reason,
+                rejection.guardian_rejection_reason,
                 GuardianRejectionReason::HarnessUnavailable
             );
             assert_eq!(
-                rejection.payload().explanation.payload(),
+                rejection.explanation,
                 "guardian is required but no guardian agent is configured"
             );
         }
         other => panic!("expected GuardianRejected for missing proposal judge, got {other:?}"),
     }
     assert_eq!(engine.record_count(), 1);
-    assert!(!setup_identifier.payload().is_empty());
+    assert!(!setup_identifier.is_empty());
     assert_eq!(engine.guardian_decision_count(), 1);
 }
 
@@ -210,25 +198,28 @@ fn daemon_admission_includes_existing_record_context_for_lifecycle_operations() 
         clarify_identifier,
         "redacted clarify replacement",
     ));
-    assert!(matches!(clarified.root(), Output::Clarified(_)));
+    assert!(matches!(clarified.root(), Response::Clarified(_)));
     let changed = engine.handle(input_change_record(
         change_identifier,
         entry("change replacement"),
     ));
-    assert!(matches!(changed.root(), Output::RecordChanged(_)));
+    assert!(matches!(changed.root(), Response::RecordChanged(_)));
     let superseded = engine.handle(input_supersede(
         supersede_identifier,
         entry("supersede replacement"),
     ));
-    assert!(matches!(superseded.root(), Output::Superseded(_)));
+    assert!(matches!(superseded.root(), Response::Superseded(_)));
     let retired = engine.handle(input_retire(retire_identifier));
-    assert!(matches!(retired.root(), Output::Retired(_)));
+    assert!(matches!(retired.root(), Response::Retired(_)));
     let resolved = engine.handle(input_resolve_clarification(
         resolution_identifier,
         resolution_target_identifier,
         "redacted resolution replacement",
     ));
-    assert!(matches!(resolved.root(), Output::ClarificationResolved(_)));
+    assert!(matches!(
+        resolved.root(),
+        Response::ClarificationResolved(_)
+    ));
 
     let requests = judge.join();
     assert_eq!(
@@ -258,66 +249,64 @@ fn daemon_admission_includes_existing_record_context_for_lifecycle_operations() 
     ));
 }
 
-fn admission_operation(request: &SpiritJudgeRequest) -> &AdmissionJudgeOperation {
-    let SpiritJudgeRequest::JudgeAdmission(packet) = request;
-    &packet.operation
+fn admission_operation(request: &SpiritJudgeQuery) -> &AdmissionJudgeOperation {
+    let SpiritJudgeQuery::JudgeAdmission(packet) = request;
+    &packet.admission_judge_operation
 }
 
 fn accept_record(engine: &mut Engine, entry: Entry) -> RecordIdentifier {
     match engine.handle(input_record(entry)).into_root() {
-        Output::RecordAccepted(identifier) => identifier.into_payload(),
+        Response::RecordAccepted(identifier) => identifier,
         other => panic!("expected setup record accepted, got {other:?}"),
     }
 }
 
 fn entry(description: &str) -> Entry {
     Entry {
-        domains: Domains::new(domain_fixtures::domains(&["judge-socket"]).into_payload()),
+        domains: domain_fixtures::domains(&["judge-socket"]),
         kind: Kind::Decision,
-        description: Description::new(description),
-        importance: Importance::new(Magnitude::Minimum),
+        description: description.into(),
+        importance: Magnitude::Minimum,
     }
 }
 
-fn input_record(entry: Entry) -> Input {
-    Input::record(record_request(entry))
+fn input_record(entry: Entry) -> Query {
+    Query::Record(record_request(entry))
 }
 
-fn input_propose(entry: Entry) -> Input {
-    Input::propose(Proposal {
+fn input_propose(entry: Entry) -> Query {
+    Query::Propose(Proposal {
         entry,
         justification: justification("proposed forward arrow"),
     })
 }
 
-fn input_clarify(record_identifier: RecordIdentifier, description: &str) -> Input {
-    Input::clarify(Clarification {
+fn input_clarify(record_identifier: RecordIdentifier, description: &str) -> Query {
+    Query::Clarify(ClarificationRequest {
         record_identifier,
-        description: Description::new(description),
+        description: description.into(),
         justification: justification(description),
     })
 }
 
-fn input_change_record(record_identifier: RecordIdentifier, entry: Entry) -> Input {
-    Input::change_record(RecordChange {
+fn input_change_record(record_identifier: RecordIdentifier, entry: Entry) -> Query {
+    Query::ChangeRecord(RecordChange {
         record_identifier,
         entry,
         justification: justification("change record"),
     })
 }
 
-fn input_supersede(record_identifier: RecordIdentifier, replacement: Entry) -> Input {
-    Input::supersede(Supersession {
-        retired_identifiers: RetiredIdentifiers::new(vec![RetiredIdentifier::new(
-            record_identifier,
-        )]),
-        replacements: Replacements::new(vec![replacement]),
+fn input_supersede(record_identifier: RecordIdentifier, replacement: Entry) -> Query {
+    Query::Supersede(Supersession {
+        retired_identifiers: vec![record_identifier],
+        replacements: vec![replacement],
         justification: justification("replacement forward arrow"),
     })
 }
 
-fn input_retire(record_identifier: RecordIdentifier) -> Input {
-    Input::retire(Retirement {
+fn input_retire(record_identifier: RecordIdentifier) -> Query {
+    Query::Retire(Retirement {
         record_identifier,
         justification: justification("retire this record"),
     })
@@ -327,21 +316,19 @@ fn input_resolve_clarification(
     clarification_identifier: RecordIdentifier,
     target_identifier: RecordIdentifier,
     description: &str,
-) -> Input {
-    Input::resolve_clarification(ClarificationResolution {
-        clarification_record_identifier: ClarificationRecordIdentifier::new(
-            clarification_identifier,
-        ),
-        target_clarifications: TargetClarifications::new(vec![TargetClarification {
+) -> Query {
+    Query::ResolveClarification(ClarificationResolution {
+        clarification_record_identifier: clarification_identifier,
+        target_clarifications: vec![TargetClarification {
             record_identifier: target_identifier,
-            description: Description::new(description),
-        }]),
+            description: description.into(),
+        }],
         justification: justification("resolve clarification"),
     })
 }
 
 fn record_request(entry: Entry) -> RecordRequest {
-    let statement = entry.description.payload().clone();
+    let statement = entry.description.clone();
     RecordRequest {
         entry,
         justification: justification(&statement),
@@ -350,10 +337,10 @@ fn record_request(entry: Entry) -> RecordRequest {
 
 fn justification(statement: &str) -> Justification {
     Justification {
-        testimony: Testimony::new(vec![VerbatimQuote::new(
-            QuoteText::new(statement.to_owned()),
-            None,
-        )]),
-        reasoning: Reasoning::new(statement.to_owned()),
+        testimony: vec![VerbatimQuote {
+            quote_text: statement.to_owned(),
+            optional_antecedent: None,
+        }],
+        reasoning: statement.to_owned(),
     }
 }

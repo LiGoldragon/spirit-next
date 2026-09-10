@@ -18,8 +18,8 @@ certainty, privacy, referent, relation, or public/private record field.
 
 ## User boundary
 
-`spirit` and the owner-only `meta-spirit` each take exactly one inline
-NOTA/DOTOS object. A bare selector such as `Version`, `Marker`, `ObserveHead`,
+`spirit` and the owner-only `spirit-meta` each take exactly one inline
+Datom object. A bare selector such as `Version`, `Marker`, `ObserveHead`,
 or `ObserveHeadObject` is already an object. File paths are not input
 indirection, and flags (including `--help` and `--pretty`), zero operands, and
 extra operands are invalid by design.
@@ -33,7 +33,7 @@ SPIRIT_SOCKET=/tmp/spirit.sock spirit Marker
 SPIRIT_SOCKET=/tmp/spirit.sock spirit '(Count (Any Any Any None Any))'
 SPIRIT_SOCKET=/tmp/spirit.sock spirit '(TextSearch [schema interface])'
 SPIRIT_SOCKET=/tmp/spirit.sock spirit '(Observe (Full [(Technology (Software (Data SchemaEvolution)))]) Any Any (Some Constraint) Any)'
-SPIRIT_META_SOCKET=/tmp/meta-spirit.sock meta-spirit ObserveHead
+SPIRIT_META_SOCKET=/tmp/meta-spirit.sock spirit-meta ObserveHead
 ```
 
 The exact ordinary command/type authority is
@@ -44,10 +44,10 @@ See [manual.md](manual.md) for the complete current object index.
 
 ## Runtime and release
 
-NOTA is an edge format only. The daemon receives binary revision-2 Signal
-frames; its startup configuration is a private immutable binary artifact,
-written by `spirit-write-configuration` and consumed by the daemon service.
-It is not an exception to the public CLI grammar.
+Datom is a client-edge format only. The zero-argument `spirit-nexus` daemon
+receives binary Signal frames, discovers its executable-owned stable Sema, and
+reads persisted desired configuration. `spirit-write-configuration` and
+`spirit-migrate-store` are offline maintenance tools, never daemon inputs.
 
 The working socket carries the 21 ordinary roots; the owner-only socket carries
 `Configure`, `Import`, `ObserveHead`, and `ObserveHeadObject`. Explicit

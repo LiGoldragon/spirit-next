@@ -1,18 +1,23 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "criome-gate")]
+use datom_codec::Datomizable;
+#[cfg(feature = "criome-gate")]
+use protos::{Protosizable, Textualizable};
+
 use sema_engine::{
     Assertion, Engine as SemaDatabase, EngineOpen, EngineRecord, FamilyName, QueryPlan, RecordKey,
     SchemaHash, SchemaVersion, TableDescriptor, TableName, TableReference,
 };
 
 #[cfg(feature = "criome-gate")]
-use crate::schema::signal::Input;
+use crate::schema::signal::Query;
 use crate::{
     schema::{
         nexus::GuardianVerdict,
         signal::{
-            Clarification, ClarificationResolution, DatabaseMarker, Entry, Proposal, RecordChange,
-            RecordRequest, RecordSet, Retirement, Supersession,
+            ClarificationRequest, ClarificationResolution, DatabaseMarker, Entry, Proposal,
+            RecordChange, RecordRequest, RecordSet, Retirement, Supersession,
         },
     },
     store::StoreError,
@@ -30,18 +35,18 @@ const GUARDIAN_DECISIONS_TABLE: TableName = TableName::new("guardian-decisions")
 // moves with GUARDIAN_JOURNAL_SCHEMA_VERSION.
 const GUARDIAN_DECISIONS_FAMILY_LABEL: &str = "spirit:guardian-journal:v7";
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 pub(crate) enum GuardianOperation {
     Record(RecordRequest),
     Propose(Proposal),
-    Clarify(Clarification),
+    Clarify(ClarificationRequest),
     ResolveClarification(ClarificationResolution),
     Supersede(Supersession),
     Retire(Retirement),
     ChangeRecord(RecordChange),
 }
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 pub(crate) enum GuardianDecision {
     Admission {
         operation: GuardianOperation,
@@ -51,7 +56,7 @@ pub(crate) enum GuardianDecision {
     },
 }
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 struct GuardianJournalEntry {
     decision_identifier: String,
     decision: GuardianDecision,
@@ -71,7 +76,7 @@ impl GuardianOperation {
         Self::Propose(proposal)
     }
 
-    pub(crate) fn clarify(clarification: Clarification) -> Self {
+    pub(crate) fn clarify(clarification: ClarificationRequest) -> Self {
         Self::Clarify(clarification)
     }
 
@@ -95,7 +100,7 @@ impl GuardianOperation {
         match self {
             Self::Record(request) => vec![&request.entry],
             Self::Propose(proposal) => vec![&proposal.entry],
-            Self::Supersede(supersession) => supersession.replacements.payload().iter().collect(),
+            Self::Supersede(supersession) => supersession.replacements.iter().collect(),
             Self::ChangeRecord(change) => vec![&change.entry],
             Self::Clarify(_) | Self::ResolveClarification(_) | Self::Retire(_) => Vec::new(),
         }
@@ -122,24 +127,27 @@ impl GuardianOperation {
         signal_criome::SpiritAuthorizationContext {
             spirit_operation_name: signal_criome::SpiritOperationName::new(self.name()),
             raw_spirit_operation_payload: signal_criome::RawSpiritOperationPayload::new(
-                nota::NotaEncode::to_nota(&self.as_signal_input()),
+                self.as_signal_input()
+                    .datomize(vec![])
+                    .protosize()
+                    .textualize(),
             ),
             spirit_process_key: target_key,
         }
     }
 
     #[cfg(feature = "criome-gate")]
-    fn as_signal_input(&self) -> Input {
+    fn as_signal_input(&self) -> Query {
         match self {
-            Self::Record(request) => Input::record(request.clone()),
-            Self::Propose(proposal) => Input::propose(proposal.clone()),
-            Self::Clarify(clarification) => Input::clarify(clarification.clone()),
+            Self::Record(request) => Query::Record(request.clone()),
+            Self::Propose(proposal) => Query::Propose(proposal.clone()),
+            Self::Clarify(clarification) => Query::Clarify(clarification.clone()),
             Self::ResolveClarification(resolution) => {
-                Input::resolve_clarification(resolution.clone())
+                Query::ResolveClarification(resolution.clone())
             }
-            Self::Supersede(supersession) => Input::supersede(supersession.clone()),
-            Self::Retire(retirement) => Input::retire(retirement.clone()),
-            Self::ChangeRecord(change) => Input::change_record(change.clone()),
+            Self::Supersede(supersession) => Query::Supersede(supersession.clone()),
+            Self::Retire(retirement) => Query::Retire(retirement.clone()),
+            Self::ChangeRecord(change) => Query::ChangeRecord(change.clone()),
         }
     }
 }

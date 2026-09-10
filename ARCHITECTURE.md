@@ -52,13 +52,11 @@ materialized database reads and writes. Effects own state outside the direct
 SEMA root, including the lifecycle archive, guardian exchange, stashes, and
 subscriptions.
 
-The daemon keeps working and meta sockets distinct. `spirit` and `meta-spirit`
-are the public object CLIs: each accepts exactly one inline NOTA/DOTOS object,
+The daemon keeps working and meta sockets distinct. `spirit` and `spirit-meta`
+are the public object CLIs: each accepts exactly one inline Datom object,
 including a bare typed atom, and accepts neither flags nor file-path
 indirection. Configuration is instead a private binary startup artifact; the
-daemon does not parse text configuration. NOTA is an edge format for CLIs and
-configuration writers, never the daemon transport. The daemon configuration
-path is a service interface, not an exception to the public CLI grammar.
+daemon does not parse text configuration. Datom belongs to clients and offline maintenance tools, never the daemon transport. `spirit-nexus` has no startup configuration argument: it opens the executable-owned stable Sema location and reads its persisted desired configuration.
 
 ## Read semantics
 

@@ -45,7 +45,6 @@ macro_rules! archived_unit_enum {
             rkyv::Archive,
             rkyv::Serialize,
             rkyv::Deserialize,
-            nota::NotaEncode,
             Clone,
             Copy,
             Debug,
@@ -447,9 +446,7 @@ archived_unit_enum!(EngineeringLeaf {
     Modularity,
 });
 
-#[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, nota::NotaEncode, Clone, Debug, PartialEq, Eq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Domain {
     All,
     Health(Health),
@@ -478,17 +475,13 @@ pub enum Domain {
     Technology(Technology),
 }
 
-#[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, nota::NotaEncode, Clone, Debug, PartialEq, Eq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Technology {
     Hardware(HardwareLeaf),
     Software(Software),
 }
 
-#[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, nota::NotaEncode, Clone, Debug, PartialEq, Eq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Software {
     Programming(ProgrammingLeaf),
     Theory,
@@ -525,14 +518,7 @@ archived_unit_enum!(Magnitude {
 macro_rules! archived_newtype {
     ($name:ident($inner:ty)) => {
         #[derive(
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            nota::NotaEncode,
-            Clone,
-            Debug,
-            PartialEq,
-            Eq,
+            rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
         )]
         pub struct $name($inner);
 

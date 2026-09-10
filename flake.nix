@@ -84,10 +84,6 @@
       url = "github:LiGoldragon/signal-spirit-judge/4fc339fee6adf3aeed82125aa0de8940bdd1f589";
       flake = false;
     };
-    nota-text-query-source = {
-      url = "github:LiGoldragon/nota-text-query";
-      flake = false;
-    };
     meta-signal-spirit-source = {
       url = "github:LiGoldragon/meta-signal-spirit/009cb6c8ddf985244189a79d554aa5d5c24605c8";
       flake = false;
@@ -186,7 +182,6 @@
       meta-signal-criome-source,
       signal-spirit-source,
       signal-spirit-judge-source,
-      nota-text-query-source,
       meta-signal-spirit-source,
       signal-agent-source,
       signal-introspect-source,
@@ -245,7 +240,6 @@
               metaSignalCriomeSource = meta-signal-criome-source;
               signalSpiritSource = signal-spirit-source;
               signalSpiritJudgeSource = signal-spirit-judge-source;
-              notaTextQuerySource = nota-text-query-source;
               metaSignalSpiritSource = meta-signal-spirit-source;
               signalAgentSource = signal-agent-source;
               signalIntrospectSource = signal-introspect-source;
@@ -284,7 +278,6 @@
               cp -R "$metaSignalCriomeSource" $out/vendor-sources/meta-signal-criome
               cp -R "$signalSpiritSource" $out/vendor-sources/signal-spirit
               cp -R "$signalSpiritJudgeSource" $out/vendor-sources/signal-spirit-judge
-              cp -R "$notaTextQuerySource" $out/vendor-sources/nota-text-query
               cp -R "$metaSignalSpiritSource" $out/vendor-sources/meta-signal-spirit
               cp -R "$signalAgentSource" $out/vendor-sources/signal-agent
               cp -R "$signalIntrospectSource" $out/vendor-sources/signal-introspect
@@ -338,7 +331,6 @@
                 --replace-fail 'signal-spirit = { git = "https://github.com/LiGoldragon/signal-spirit.git", rev = "b37fc963292c157452d06e150296c19005dae3f2" }' 'signal-spirit = { path = "vendor-sources/signal-spirit" }' \
                 --replace-fail 'signal-spirit-judge = { git = "https://github.com/LiGoldragon/signal-spirit-judge.git", rev = "4fc339fee6adf3aeed82125aa0de8940bdd1f589", optional = true }' 'signal-spirit-judge = { path = "vendor-sources/signal-spirit-judge", optional = true }' \
                 --replace-fail 'meta-signal-spirit = { git = "https://github.com/LiGoldragon/meta-signal-spirit.git", rev = "009cb6c8ddf985244189a79d554aa5d5c24605c8" }' 'meta-signal-spirit = { path = "vendor-sources/meta-signal-spirit" }' \
-                --replace-fail 'nota-text-query = { git = "https://github.com/LiGoldragon/nota-text-query.git", rev = "6140a3e9afe3f81c18a39cb0a11dec4eab68b561", default-features = false }' 'nota-text-query = { path = "vendor-sources/nota-text-query", default-features = false }' \
                 --replace-fail 'triad-runtime = { git = "https://github.com/LiGoldragon/triad-runtime.git", branch = "main" }' 'triad-runtime = { path = "vendor-sources/triad-runtime" }' \
                 --replace-fail 'schema-rust = { package = "schema-rust", git = "https://github.com/LiGoldragon/schema-rust.git", rev = "f3b4563163dd11ba1cbbcca8081701ab7830b8f5" }' 'schema-rust = { path = "vendor-sources/schema-rust", package = "schema-rust" }' \
                 --replace-fail 'agent = { git = "https://github.com/LiGoldragon/agent.git", branch = "main", features = ["live-provider"] }' 'agent = { path = "vendor-sources/agent", features = ["live-provider"] }' \
@@ -467,9 +459,6 @@
               [patch."https://github.com/LiGoldragon/triad-runtime.git"]
               triad-runtime = { path = "vendor-sources/triad-runtime" }
 
-              [patch."https://github.com/LiGoldragon/nota-text-query.git"]
-              nota-text-query = { path = "vendor-sources/nota-text-query" }
-
               [patch."https://github.com/LiGoldragon/signal-spirit.git"]
               signal-spirit = { path = "vendor-sources/signal-spirit" }
 
@@ -580,7 +569,6 @@
               "signal-sema",
               "signal-spirit",
               "signal-spirit-judge",
-              "nota-text-query",
               "triad-runtime",
               "version-projection",
               "mirror",
@@ -678,10 +666,34 @@
             cargoExtraArgs = "--no-default-features";
           }
         );
-        notaTextCargoArtifacts = craneLib.buildDepsOnly (
+        nexusCargoArtifacts = craneLib.buildDepsOnly (
           commonArguments
           // {
-            cargoExtraArgs = "--features nota-text";
+            cargoExtraArgs = "-p spirit-nexus";
+          }
+        );
+        spiritClientCargoArtifacts = craneLib.buildDepsOnly (
+          commonArguments
+          // {
+            cargoExtraArgs = "-p spirit-client";
+          }
+        );
+        spiritMetaClientCargoArtifacts = craneLib.buildDepsOnly (
+          commonArguments
+          // {
+            cargoExtraArgs = "-p spirit-meta-client";
+          }
+        );
+        spiritOfflineToolsCargoArtifacts = craneLib.buildDepsOnly (
+          commonArguments
+          // {
+            cargoExtraArgs = "-p spirit-offline-tools";
+          }
+        );
+        datomCliCargoArtifacts = craneLib.buildDepsOnly (
+          commonArguments
+          // {
+            cargoExtraArgs = "--features datom-cli";
           }
         );
         productionMigrationCargoArtifacts = craneLib.buildDepsOnly (
@@ -702,10 +714,10 @@
             cargoExtraArgs = "--features testing-trace";
           }
         );
-        notaTextTestingTraceCargoArtifacts = craneLib.buildDepsOnly (
+        datomCliTestingTraceCargoArtifacts = craneLib.buildDepsOnly (
           commonArguments
           // {
-            cargoExtraArgs = "--features nota-text,testing-trace";
+            cargoExtraArgs = "--features datom-cli,testing-trace";
           }
         );
         clusterAuthorizationCargoArtifacts = craneLib.buildDepsOnly (
@@ -740,57 +752,57 @@
         daemonPackage = craneLib.buildPackage (
           commonArguments
           // {
-            cargoArtifacts = agentGuardianCargoArtifacts;
-            cargoExtraArgs = "--features agent-guardian --bin spirit-daemon";
+            cargoArtifacts = nexusCargoArtifacts;
+            cargoExtraArgs = "-p spirit-nexus --bin spirit-nexus";
           }
         );
         cliPackage = craneLib.buildPackage (
           commonArguments
           // {
-            cargoArtifacts = notaTextCargoArtifacts;
-            cargoExtraArgs = "--features nota-text --bin spirit";
+            cargoArtifacts = spiritClientCargoArtifacts;
+            cargoExtraArgs = "-p spirit-client --bin spirit";
           }
         );
         metaSpiritCliPackage = craneLib.buildPackage (
           commonArguments
           // {
-            cargoArtifacts = notaTextCargoArtifacts;
-            cargoExtraArgs = "--features nota-text --bin meta-spirit";
+            cargoArtifacts = spiritMetaClientCargoArtifacts;
+            cargoExtraArgs = "-p spirit-meta-client --bin spirit-meta";
           }
         );
         configurationWriterPackage = craneLib.buildPackage (
           commonArguments
           // {
-            cargoArtifacts = notaTextCargoArtifacts;
-            cargoExtraArgs = "--features nota-text --bin spirit-write-configuration";
+            cargoArtifacts = spiritOfflineToolsCargoArtifacts;
+            cargoExtraArgs = "-p spirit-offline-tools --bin spirit-write-configuration";
           }
         );
         storeMigrationPackage = craneLib.buildPackage (
           commonArguments
           // {
-            cargoArtifacts = productionMigrationCargoArtifacts;
-            cargoExtraArgs = "--features production-migration --bin spirit-migrate-store";
+            cargoArtifacts = spiritOfflineToolsCargoArtifacts;
+            cargoExtraArgs = "-p spirit-offline-tools --bin spirit-migrate-store";
           }
         );
         traceDaemonPackage = craneLib.buildPackage (
           commonArguments
           // {
-            cargoArtifacts = testingTraceCargoArtifacts;
-            cargoExtraArgs = "--features testing-trace --bin spirit-daemon";
+            cargoArtifacts = nexusCargoArtifacts;
+            cargoExtraArgs = "-p spirit-nexus --features testing-trace --bin spirit-nexus";
           }
         );
         traceCliPackage = craneLib.buildPackage (
           commonArguments
           // {
-            cargoArtifacts = notaTextTestingTraceCargoArtifacts;
-            cargoExtraArgs = "--features nota-text,testing-trace --bin spirit";
+            cargoArtifacts = spiritClientCargoArtifacts;
+            cargoExtraArgs = "-p spirit-client --features testing-trace --bin spirit";
           }
         );
         combinedPackage = pkgs.runCommand "spirit" { } ''
           mkdir -p "$out/bin"
           ln -s "${cliPackage}/bin/spirit" "$out/bin/spirit"
-          ln -s "${metaSpiritCliPackage}/bin/meta-spirit" "$out/bin/meta-spirit"
-          ln -s "${daemonPackage}/bin/spirit-daemon" "$out/bin/spirit-daemon"
+          ln -s "${metaSpiritCliPackage}/bin/spirit-meta" "$out/bin/spirit-meta"
+          ln -s "${daemonPackage}/bin/spirit-nexus" "$out/bin/spirit-nexus"
           ln -s "${configurationWriterPackage}/bin/spirit-write-configuration" "$out/bin/spirit-write-configuration"
           ln -s "${storeMigrationPackage}/bin/spirit-migrate-store" "$out/bin/spirit-migrate-store"
         '';
@@ -876,19 +888,16 @@
         serviceBundleInterfaceCheck = pkgs.runCommand "spirit-service-bundle-interface" { } ''
           set -eu
 
-          test -s ${serviceBundleWitness.daemonConfiguration}/${serviceBundleWitness.paths.configurationPath}
           test -d ${serviceBundleWitness.packages.judgeConfig}/prompts
-          test -x ${serviceBundleWitness.daemonServiceWrapper}/bin/spirit-daemon-service
+          test -x ${serviceBundleWitness.daemonServiceWrapper}/bin/spirit-nexus-service
           test -x ${serviceBundleWitness.judgeServiceWrapper}/bin/spirit-judge-daemon-service
           test -x ${serviceBundleWitness.commandLineWrapper}/bin/spirit
-          test -x ${serviceBundleWitness.metaSpiritCommandLineWrapper}/bin/meta-spirit
+          test -x ${serviceBundleWitness.metaSpiritCommandLineWrapper}/bin/spirit-meta
 
-          ${pkgs.bash}/bin/bash -n ${serviceBundleWitness.daemonServiceWrapper}/bin/spirit-daemon-service
+          ${pkgs.bash}/bin/bash -n ${serviceBundleWitness.daemonServiceWrapper}/bin/spirit-nexus-service
           ${pkgs.bash}/bin/bash -n ${serviceBundleWitness.judgeServiceWrapper}/bin/spirit-judge-daemon-service
-          grep -F '${combinedPackage}/bin/spirit-daemon' \
-            ${serviceBundleWitness.daemonServiceWrapper}/bin/spirit-daemon-service
-          grep -F '${serviceBundleWitness.daemonConfiguration}/${serviceBundleWitness.paths.configurationPath}' \
-            ${serviceBundleWitness.daemonServiceWrapper}/bin/spirit-daemon-service
+          grep -F '${combinedPackage}/bin/spirit-nexus' \
+            ${serviceBundleWitness.daemonServiceWrapper}/bin/spirit-nexus-service
           grep -F '${judgePackage}/bin/spirit-judge' \
             ${serviceBundleWitness.judgeServiceWrapper}/bin/spirit-judge-daemon-service
           grep -F '${judgeConfigPackage}' \
@@ -913,7 +922,7 @@
         traceCombinedPackage = pkgs.runCommand "spirit-trace" { } ''
           mkdir -p "$out/bin"
           ln -s "${traceCliPackage}/bin/spirit" "$out/bin/spirit"
-          ln -s "${traceDaemonPackage}/bin/spirit-daemon" "$out/bin/spirit-daemon"
+          ln -s "${traceDaemonPackage}/bin/spirit-nexus" "$out/bin/spirit-nexus"
           ln -s "${configurationWriterPackage}/bin/spirit-write-configuration" "$out/bin/spirit-write-configuration"
         '';
         nixIntegrationRunner = pkgs.writeShellApplication {
@@ -958,11 +967,11 @@
               cargoExtraArgs = "--no-default-features";
             }
           );
-          build-nota-text = craneLib.cargoBuild (
+          build-datom-cli = craneLib.cargoBuild (
             commonArguments
             // {
-              cargoArtifacts = notaTextCargoArtifacts;
-              cargoExtraArgs = "--features nota-text";
+              cargoArtifacts = datomCliCargoArtifacts;
+              cargoExtraArgs = "--features datom-cli";
             }
           );
           test = craneLib.cargoTest (
@@ -972,11 +981,11 @@
               cargoExtraArgs = "--no-default-features";
             }
           );
-          test-nota-text = craneLib.cargoTest (
+          test-datom-cli = craneLib.cargoTest (
             commonArguments
             // {
-              cargoArtifacts = notaTextCargoArtifacts;
-              cargoExtraArgs = "--features nota-text";
+              cargoArtifacts = datomCliCargoArtifacts;
+              cargoExtraArgs = "--features datom-cli";
             }
           );
           test-production-migration-v13 = craneLib.cargoTest (
@@ -1001,15 +1010,15 @@
           spirit-observe-head-object-rehashes-to-head = craneLib.cargoTest (
             commonArguments
             // {
-              cargoArtifacts = notaTextCargoArtifacts;
-              cargoExtraArgs = "--features nota-text --test observe_head_object";
+              cargoArtifacts = datomCliCargoArtifacts;
+              cargoExtraArgs = "--features datom-cli --test observe_head_object";
             }
           );
           test-configuration-writer-process-boundary = craneLib.cargoTest (
             commonArguments
             // {
-              cargoArtifacts = notaTextCargoArtifacts;
-              cargoExtraArgs = "--features nota-text --test process_boundary configuration_writer_prebuilds_binary_archive_for_daemon_startup -- --exact";
+              cargoArtifacts = datomCliCargoArtifacts;
+              cargoExtraArgs = "--features datom-cli --test process_boundary configuration_writer_accepts_judge_socket_without_output_budget -- --exact";
             }
           );
           test-testing-trace = craneLib.cargoTest (
@@ -1022,8 +1031,8 @@
           test-testing-trace-process-boundary = craneLib.cargoTest (
             commonArguments
             // {
-              cargoArtifacts = notaTextTestingTraceCargoArtifacts;
-              cargoExtraArgs = "--features nota-text,testing-trace --test process_boundary cli_receives_testing_trace_events_from_daemon_trace_socket -- --exact";
+              cargoArtifacts = datomCliTestingTraceCargoArtifacts;
+              cargoExtraArgs = "--features datom-cli,testing-trace --test process_boundary cli_receives_testing_trace_events_from_daemon_trace_socket -- --exact";
             }
           );
           no-old-signal-macro = pkgs.runCommand "spirit-no-old-signal-macro" { } ''
@@ -1046,9 +1055,9 @@
                 test ! -e ${src}/schema/domain.schema
                 test ! -e ${src}/src/schema/signal.rs
                 test ! -e ${src}/src/schema/domain.rs
-                test -f ${src}/src/schema/nexus.rs
-                test -f ${src}/src/schema/sema.rs
-                test -f ${src}/src/schema/daemon.rs
+                test -f ${src}/src/component_nexus.rs
+                test -f ${src}/src/component_sema.rs
+                test -f ${src}/src/component_daemon.rs
                 ! grep -R "lower_source(" ${src}/build.rs
                 ! grep -R "lower_source_with_context" ${src}/build.rs
                 ! grep -R "macros_applied" ${src}/build.rs
@@ -1058,13 +1067,13 @@
                 ! grep -R "include!(concat!(env!(\"OUT_DIR\")" ${src}/src ${src}/build.rs
                 touch $out
               '';
-          nota-surface-is-opt-in = pkgs.runCommand "spirit-nota-surface-is-opt-in" { } ''
+          nexus-binary-surface-is-text-free = pkgs.runCommand "spirit-nexus-binary-surface-is-text-free" { } ''
             # Positive proof lives in tests/dependency_surface.rs, which
-            # runs cargo tree for the binary-only and nota-text surfaces.
+            # runs cargo tree for the separate Nexus and Datom-client surfaces.
             # This check is only the negative guard for daemon-side text
             # decoder leakage.
-            ! grep -R "nota" ${src}/src/config.rs ${src}/src/daemon.rs ${src}/src/bin/spirit-daemon.rs
-            ! grep -R "NotaSource" ${src}/src/config.rs ${src}/src/daemon.rs ${src}/src/bin/spirit-daemon.rs
+            ! grep -R "nota" ${src}/src/config.rs ${src}/src/daemon.rs ${src}/crates/spirit-nexus/src/main.rs
+            ! grep -R "NotaSource" ${src}/src/config.rs ${src}/src/daemon.rs ${src}/crates/spirit-nexus/src/main.rs
             touch $out
           '';
           binary-boundary-test = pkgs.runCommand "spirit-binary-boundary-test" { } ''
@@ -1122,18 +1131,18 @@
               cargoClippyExtraArgs = "--all-targets -- -D warnings";
             }
           );
-          clippy-nota-text = craneLib.cargoClippy (
+          clippy-datom-cli = craneLib.cargoClippy (
             commonArguments
             // {
               cargoArtifacts = null;
-              cargoClippyExtraArgs = "--features nota-text --all-targets -- -D warnings";
+              cargoClippyExtraArgs = "--features datom-cli --all-targets -- -D warnings";
             }
           );
           clippy-testing-trace = craneLib.cargoClippy (
             commonArguments
             // {
-              cargoArtifacts = notaTextTestingTraceCargoArtifacts;
-              cargoClippyExtraArgs = "--features nota-text,testing-trace --all-targets -- -D warnings";
+              cargoArtifacts = datomCliTestingTraceCargoArtifacts;
+              cargoClippyExtraArgs = "--features datom-cli,testing-trace --all-targets -- -D warnings";
             }
           );
           doc = craneLib.cargoDoc (

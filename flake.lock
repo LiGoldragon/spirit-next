@@ -328,22 +328,6 @@
         "type": "github"
       }
     },
-    "nota-text-query-source": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1783351457,
-        "narHash": "sha256-V7cw3bFmHGlT47aW/h9z79o9YaHS2fhLH2x+P1mFW7I=",
-        "owner": "LiGoldragon",
-        "repo": "nota-text-query",
-        "rev": "6140a3e9afe3f81c18a39cb0a11dec4eab68b561",
-        "type": "github"
-      },
-      "original": {
-        "owner": "LiGoldragon",
-        "repo": "nota-text-query",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
         "agent-source": "agent-source",
@@ -359,7 +343,6 @@
         "mirror-source": "mirror-source",
         "nixpkgs": "nixpkgs",
         "nota-source": "nota-source",
-        "nota-text-query-source": "nota-text-query-source",
         "router-source": "router-source",
         "rust-build": "rust-build",
         "schema-language-source": "schema-language-source",

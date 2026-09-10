@@ -2,16 +2,20 @@ mod archive;
 mod error;
 mod family_directory;
 #[cfg(feature = "agent-guardian")]
+use crate::schema::signal::{RecordSet, Selection};
+
+#[cfg(feature = "agent-guardian")]
 mod guardian_bundle;
 mod record_identifier;
 
 use std::{
     collections::BTreeSet,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+use nexus::Configurable as _;
 #[cfg(feature = "mirror-shipper")]
 use sema_engine::PortableCheckpoint;
 use sema_engine::{
@@ -25,39 +29,35 @@ pub use error::StoreError;
 pub use family_directory::StoreFamilyDirectory;
 #[cfg(feature = "agent-guardian")]
 use guardian_bundle::GuardianRecordBundle;
-use nota_text_query::{
-    Query as TextQuery, QueryTerm, SearchOutcome, SearchText as QuerySearchText,
-};
 use record_identifier::RecordIdentifierMint;
 
 #[cfg(feature = "agent-guardian")]
 use crate::guardian_journal::{GuardianDecision, GuardianJournal, GuardianOperation};
+use crate::schema::sema::Contentful as SemaContentful;
 use crate::schema::{
     meta_signal::ArchiveDatabaseTarget,
     sema::{
         self as sema_schema, EngineStartFailure as SemaEngineStartFailure,
         EngineStopFailure as SemaEngineStopFailure, Migration, ReadInput as SemaReadInput,
-        ReadOutput as SemaReadOutput, RecordFamily, SemaEngine, StoredRecord,
-        WriteInput as SemaWriteInput, WriteOutput as SemaWriteOutput,
+        ReadOutput as SemaReadOutput, RecordFamily, SemaEngine, StoredNexusConfiguration,
+        StoredRecord, WriteInput as SemaWriteInput, WriteOutput as SemaWriteOutput,
     },
     signal::{
-        Clarification, ClarificationReceipt, ClarificationRecordIdentifier,
-        ClarificationResolution, ClarificationResolutionReceipt, CountedRecords, DatabaseMarker,
-        Description, Domain, DomainMatch, DomainScope, DomainScopes, Entry, ErrorMessage,
-        ErrorReport, Explanation, FoundRecord, GuardianRejection, GuardianRejectionReason,
-        Importance, ImportanceBump, ImportanceBumpReceipt, ImportanceSelection, Keyword,
-        KeywordMatch, Keywords, Magnitude, ObservedRecord, ObservedRecords, Query, RecordChange,
-        RecordChangeReceipt, RecordCount, RecordIdentifier, RecordIdentifiers, RecordSet,
-        Retirement, RetirementReceipt, SearchText, SemaReceipt, Supersession, SupersessionReceipt,
-        TextMatch,
+        ClarificationReceipt, ClarificationRequest, ClarificationResolution,
+        ClarificationResolutionReceipt, CountedRecords, DatabaseMarker, Description, DomainMatch,
+        Entry, ErrorReport, FoundRecord, GuardianRejection, GuardianRejectionReason, Importance,
+        ImportanceBump, ImportanceBumpReceipt, ImportanceSelection, Keyword, KeywordMatch,
+        Keywords, Magnitude, ObservedRecord, ObservedRecords, Query, RecordChange,
+        RecordChangeReceipt, Retirement, RetirementReceipt, SearchText, SemaReceipt,
+        SpiritNexusConfiguration, Supersession, SupersessionReceipt, TextMatch,
     },
 };
 
 const TEXT_SEARCH_LIMIT: usize = 25;
 
-#[cfg(feature = "agent-guardian")]
-use crate::schema::signal::SelectedKind;
-use signal_spirit::SpiritDomainScopes;
+use signal_domain::{
+    DataLeaf, Domain, DomainScope, DomainScopes, SoftwareDomain, TechnologyDomain,
+};
 
 #[cfg(feature = "testing-trace")]
 use crate::{ObjectName, TraceEvent, TraceLog, schema::sema::SemaObjectName};
@@ -65,12 +65,12 @@ use crate::{ObjectName, TraceEvent, TraceLog, schema::sema::SemaObjectName};
 // Version 14 contains only live records and migration receipts. The offline
 // migration projects v13 live and lifecycle-archive records into fresh v14
 // stores; no prior log or retired-family row is replayed.
-pub(super) const SPIRIT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(14);
+pub(super) const SPIRIT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(15);
 
 /// The v14 mirror/log generation. It is deliberately distinct from the v13
 /// `spirit:sema` root, so no current checkpoint or suffix can attach to the
 /// legacy history that contains retired fields.
-pub const SPIRIT_STORE_NAME: &str = "spirit:sema:v14";
+pub const SPIRIT_STORE_NAME: &str = "spirit:sema:v15";
 
 /// The SEMA durable store: a sema-engine keyed table written to a `*.sema`
 /// file.
@@ -87,6 +87,7 @@ pub struct Store {
     database: Arc<SemaDatabase>,
     entries: TableReference<StoredRecord>,
     migrations: TableReference<Migration>,
+    configurations: TableReference<StoredNexusConfiguration>,
     path: PathBuf,
     archive_target: ArchiveDatabaseTarget,
     #[cfg(feature = "testing-trace")]
@@ -179,35 +180,34 @@ impl SemaEngine for Store {
     ) -> sema_schema::sema::Sema<sema_schema::sema::WriteOutput> {
         let origin_route = command.origin_route();
         let output = match command.into_root() {
-            SemaWriteInput::Record(record) => match self.record(record.into_payload()) {
+            SemaWriteInput::Record(record) => match self.record(record.content()) {
                 Ok(identifier) => SemaWriteOutput::recorded(SemaReceipt {
-                    record_identifier: RecordIdentifier::new(identifier),
+                    record_identifier: identifier,
                     database_marker: self.database_marker(),
                 }),
-                Err(error) => {
-                    SemaWriteOutput::missed(ErrorReport::new(ErrorMessage::new(error.to_string())))
-                }
+                Err(error) => SemaWriteOutput::missed(ErrorReport {
+                    error_message: error.to_string(),
+                }),
             },
             SemaWriteInput::BumpImportance(change) => {
-                match self.bump_importance(change.into_payload()) {
+                match self.bump_importance(change.content()) {
                     Ok(Some(receipt)) => SemaWriteOutput::importance_bumped(receipt),
-                    Ok(None) => SemaWriteOutput::missed(ErrorReport::new(ErrorMessage::new(
-                        "record not found",
-                    ))),
-                    Err(error) => SemaWriteOutput::missed(ErrorReport::new(ErrorMessage::new(
-                        error.to_string(),
-                    ))),
+                    Ok(None) => SemaWriteOutput::missed(ErrorReport {
+                        error_message: "record not found".into(),
+                    }),
+                    Err(error) => SemaWriteOutput::missed(ErrorReport {
+                        error_message: error.to_string(),
+                    }),
                 }
             }
-            SemaWriteInput::ChangeRecord(change) => match self.change_record(change.into_payload())
-            {
+            SemaWriteInput::ChangeRecord(change) => match self.change_record(change.content()) {
                 Ok(Some(receipt)) => SemaWriteOutput::record_changed(receipt),
-                Ok(None) => {
-                    SemaWriteOutput::missed(ErrorReport::new(ErrorMessage::new("record not found")))
-                }
-                Err(error) => {
-                    SemaWriteOutput::missed(ErrorReport::new(ErrorMessage::new(error.to_string())))
-                }
+                Ok(None) => SemaWriteOutput::missed(ErrorReport {
+                    error_message: "record not found".into(),
+                }),
+                Err(error) => SemaWriteOutput::missed(ErrorReport {
+                    error_message: error.to_string(),
+                }),
             },
         };
         output.with_origin_route(origin_route)
@@ -219,59 +219,65 @@ impl SemaEngine for Store {
     ) -> sema_schema::sema::Sema<sema_schema::sema::ReadOutput> {
         let origin_route = query.origin_route();
         let output = match query.into_root() {
-            SemaReadInput::Observe(observe) => match self.observe(observe.payload()) {
-                Ok(entries) if !entries.is_empty() => {
-                    SemaReadOutput::observed(ObservedRecords::new(RecordSet::new(entries)))
-                }
-                Ok(_) => SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(
-                    "no matching record",
-                ))),
-                Err(error) => {
-                    SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(error.to_string())))
-                }
+            SemaReadInput::Observe(observe) => match self.observe(&observe.content()) {
+                Ok(entries) if !entries.is_empty() => SemaReadOutput::observed(ObservedRecords {
+                    record_set: entries,
+                }),
+                Ok(_) => SemaReadOutput::missed(ErrorReport {
+                    error_message: "no matching record".into(),
+                }),
+                Err(error) => SemaReadOutput::missed(ErrorReport {
+                    error_message: error.to_string(),
+                }),
             },
-            SemaReadInput::Intent(intent) => match self.intent(intent.payload()) {
+            SemaReadInput::Intent(intent) => match self.intent(&intent.content()) {
                 Ok(entries) if !entries.is_empty() => {
-                    SemaReadOutput::intent_results(ObservedRecords::new(RecordSet::new(entries)))
+                    SemaReadOutput::intent_results(ObservedRecords {
+                        record_set: entries,
+                    })
                 }
-                Ok(_) => SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(
-                    "no matching record",
-                ))),
-                Err(error) => {
-                    SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(error.to_string())))
-                }
+                Ok(_) => SemaReadOutput::missed(ErrorReport {
+                    error_message: "no matching record".into(),
+                }),
+                Err(error) => SemaReadOutput::missed(ErrorReport {
+                    error_message: error.to_string(),
+                }),
             },
-            SemaReadInput::TextSearch(search) => match self.text_search(search.payload()) {
-                Ok(entries) if !entries.is_empty() => SemaReadOutput::text_search_results(
-                    ObservedRecords::new(RecordSet::new(entries)),
-                ),
-                Ok(_) => SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(
-                    "no matching record",
-                ))),
-                Err(error) => {
-                    SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(error.to_string())))
+            SemaReadInput::TextSearch(search) => match self.text_search(&search.content()) {
+                Ok(entries) if !entries.is_empty() => {
+                    SemaReadOutput::text_search_results(ObservedRecords {
+                        record_set: entries,
+                    })
                 }
+                Ok(_) => SemaReadOutput::missed(ErrorReport {
+                    error_message: "no matching record".into(),
+                }),
+                Err(error) => SemaReadOutput::missed(ErrorReport {
+                    error_message: error.to_string(),
+                }),
             },
             SemaReadInput::Lookup(lookup) => {
-                let record_identifier = lookup.into_payload();
-                match self.entry_by_identifier(record_identifier.payload()) {
+                let record_identifier = lookup.content();
+                match self.entry_by_identifier(&record_identifier) {
                     Ok(Some(entry)) => SemaReadOutput::found(FoundRecord {
                         record_identifier,
                         entry,
                     }),
-                    Ok(None) => SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(
-                        "record not found",
-                    ))),
-                    Err(error) => SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(
-                        error.to_string(),
-                    ))),
+                    Ok(None) => SemaReadOutput::missed(ErrorReport {
+                        error_message: "record not found".into(),
+                    }),
+                    Err(error) => SemaReadOutput::missed(ErrorReport {
+                        error_message: error.to_string(),
+                    }),
                 }
             }
-            SemaReadInput::Count(count) => match self.count(count.payload()) {
-                Ok(count) => SemaReadOutput::counted(CountedRecords::new(RecordCount::new(count))),
-                Err(error) => {
-                    SemaReadOutput::missed(ErrorReport::new(ErrorMessage::new(error.to_string())))
-                }
+            SemaReadInput::Count(count) => match self.count(&count.content()) {
+                Ok(count) => SemaReadOutput::counted(CountedRecords {
+                    record_count: i64::try_from(count).expect("count fits i64"),
+                }),
+                Err(error) => SemaReadOutput::missed(ErrorReport {
+                    error_message: error.to_string(),
+                }),
             },
         };
         output.with_origin_route(origin_route)
@@ -293,6 +299,38 @@ impl Store {
     /// descriptor, so the log is the authoritative replayable history of
     /// the intent corpus.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_with_configuration(path, crate::Configuration::default_nexus_configuration())
+    }
+
+    /// Open a stable Sema and seed its one lifecycle row only when it is new.
+    /// Existing state is never replaced by an executable default.
+    pub fn open_with_configuration(
+        path: impl Into<PathBuf>,
+        default_configuration: SpiritNexusConfiguration,
+    ) -> Result<Self, StoreError> {
+        let path = path.into();
+        // sema-engine can update bookkeeping while discovering a schema
+        // mismatch. Probe a disposable byte-for-byte copy first so a normal
+        // zero-argument startup cannot alter an unmigrated stable Sema.
+        if path.exists() {
+            let probe =
+                path.with_extension(format!("spirit-open-probe-{}.sema", std::process::id()));
+            if probe.exists() {
+                fs::remove_file(&probe)?;
+            }
+            fs::copy(&path, &probe)?;
+            let probe_result =
+                Self::open_with_configuration_unchecked(&probe, default_configuration.clone());
+            let _ = fs::remove_file(&probe);
+            probe_result?;
+        }
+        Self::open_with_configuration_unchecked(path, default_configuration)
+    }
+
+    fn open_with_configuration_unchecked(
+        path: impl Into<PathBuf>,
+        default_configuration: SpiritNexusConfiguration,
+    ) -> Result<Self, StoreError> {
         let path = path.into();
         let mut database = SemaDatabase::open(
             EngineOpen::new(path.clone(), SPIRIT_SCHEMA_VERSION)
@@ -300,15 +338,19 @@ impl Store {
         )?;
         let entries = database.register_table(RecordFamily::records_family())?;
         let migrations = database.register_table(RecordFamily::migrations_family())?;
-        Ok(Self {
+        let configurations = database.register_table(RecordFamily::nexus_configurations_family())?;
+        let store = Self {
             database: Arc::new(database),
             entries,
             migrations,
+            configurations,
             path,
             archive_target: ArchiveDatabaseTarget::Default,
             #[cfg(feature = "testing-trace")]
             trace_log: TraceLog::default(),
-        })
+        };
+        store.seed_configuration_if_absent(default_configuration)?;
+        Ok(store)
     }
 
     #[cfg(feature = "testing-trace")]
@@ -327,6 +369,57 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn seed_configuration_if_absent(
+        &self,
+        default_configuration: SpiritNexusConfiguration,
+    ) -> Result<(), StoreError> {
+        if self.configuration_rows()?.is_empty() {
+            // Only a completely new Sema may receive executable defaults. An
+            // established layout missing this family must go through the
+            // offline cutover; startup must not invent metadata over it.
+            if !self.records()?.is_empty() || !self.migrations()?.is_empty() {
+                return Err(StoreError::ConfigurationInvariant { count: 0 });
+            }
+            self.database.assert(Assertion::new(
+                self.configurations,
+                default_configuration.into(),
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn configuration_rows(&self) -> Result<Vec<StoredNexusConfiguration>, StoreError> {
+        Ok(self
+            .database
+            .match_records(QueryPlan::all(self.configurations))?
+            .records()
+            .to_vec())
+    }
+
+    /// Read the single persisted desired configuration and truthful meta marker.
+    pub fn nexus_configuration_state(
+        &self,
+    ) -> Result<nexus::ConfigurationState<SpiritNexusConfiguration>, StoreError> {
+        let rows = self.configuration_rows()?;
+        match rows.as_slice() {
+            [row] => Ok(row.state.clone()),
+            [] => Err(StoreError::ConfigurationInvariant { count: 0 }),
+            rows => Err(StoreError::ConfigurationInvariant { count: rows.len() }),
+        }
+    }
+
+    /// Persist one standard lifecycle transition atomically in the stable Sema.
+    pub fn replace_nexus_configuration(
+        &self,
+        state: nexus::ConfigurationState<SpiritNexusConfiguration>,
+    ) -> Result<(), StoreError> {
+        self.database.mutate(Mutation::new(
+            self.configurations,
+            StoredNexusConfiguration { state },
+        ))?;
+        Ok(())
     }
 
     /// Store the owner-configured archive target (the owner-only meta
@@ -408,7 +501,14 @@ impl Store {
     pub fn versioned_log_head(&self) -> Result<Option<EntryDigest>, StoreError> {
         Ok(self
             .versioned_log()?
-            .last()
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry
+                    .operations()
+                    .iter()
+                    .any(|operation| operation.table_name() == "records")
+            })
             .map(VersionedCommitLogEntry::entry_digest))
     }
 
@@ -424,7 +524,12 @@ impl Store {
     /// `versioned_log_head` digest, so the body is genuinely content-addressed,
     /// never an invented format.
     pub fn versioned_log_head_object(&self) -> Result<Option<Vec<u8>>, StoreError> {
-        match self.versioned_log()?.last() {
+        match self.versioned_log()?.iter().rev().find(|entry| {
+            entry
+                .operations()
+                .iter()
+                .any(|operation| operation.table_name() == "records")
+        }) {
             None => Ok(None),
             Some(entry) => Ok(Some(
                 rkyv::to_bytes::<rkyv::rancor::Error>(entry)
@@ -465,10 +570,12 @@ impl Store {
         session.commit(&StoreFamilyDirectory::from_generated_families())?;
         let entries = database.register_table(RecordFamily::records_family())?;
         let migrations = database.register_table(RecordFamily::migrations_family())?;
+        let configurations = database.register_table(RecordFamily::nexus_configurations_family())?;
         Ok(Self {
             database: Arc::new(database),
             entries,
             migrations,
+            configurations,
             path,
             archive_target: ArchiveDatabaseTarget::Default,
             #[cfg(feature = "testing-trace")]
@@ -493,6 +600,7 @@ impl Store {
         StoreFamilyDirectory {
             entries: self.entries,
             migrations: self.migrations,
+            configurations: self.configurations,
         }
     }
 
@@ -511,7 +619,7 @@ impl Store {
             .match_records(QueryPlan::all(self.migrations))?
             .records()
             .to_vec();
-        migrations.sort_by_key(|migration| *migration.source_schema_version.payload());
+        migrations.sort_by_key(|migration| migration.source_schema_version.clone());
         Ok(migrations)
     }
 
@@ -533,7 +641,7 @@ impl Store {
                 self.path.with_file_name(format!("{stem}.archive.sema"))
             }
             ArchiveDatabaseTarget::Path(archive_path) => {
-                PathBuf::from(archive_path.payload().payload())
+                PathBuf::from(&archive_path.archive_path_text)
             }
         }
     }
@@ -578,7 +686,7 @@ impl Store {
     fn archive_identifier(&self, live_identifier: &str) -> String {
         format!(
             "{live_identifier}-{}",
-            self.database_marker().commit_sequence.payload()
+            self.database_marker().commit_sequence
         )
     }
 
@@ -614,7 +722,7 @@ impl Store {
     }
 
     pub fn record_entry(&self, entry: Entry) -> Result<SemaReceipt, StoreError> {
-        let record_identifier = RecordIdentifier::new(self.record(entry)?);
+        let record_identifier = self.record(entry)?;
         Ok(SemaReceipt {
             record_identifier,
             database_marker: self.database_marker(),
@@ -630,22 +738,20 @@ impl Store {
         };
         let record_identifier = duplicate.record_identifier.clone();
         let _importance_receipt = self
-            .bump_importance(ImportanceBump::new(record_identifier.clone()))?
-            .ok_or_else(|| {
-                StoreError::DuplicateRecordVanished(record_identifier.payload().clone())
-            })?;
+            .bump_importance(ImportanceBump {
+                record_identifier: record_identifier.clone(),
+            })?
+            .ok_or_else(|| StoreError::DuplicateRecordVanished(record_identifier.clone()))?;
         let updated_entry = self
-            .entry_by_identifier(record_identifier.payload())?
-            .ok_or_else(|| {
-                StoreError::DuplicateRecordVanished(record_identifier.payload().clone())
-            })?;
+            .entry_by_identifier(&record_identifier)?
+            .ok_or_else(|| StoreError::DuplicateRecordVanished(record_identifier.clone()))?;
         Ok(Err(GuardianRejection {
             guardian_rejection_reason: GuardianRejectionReason::Duplicate,
-            record_set: RecordSet::new(vec![ObservedRecord {
+            record_set: vec![ObservedRecord {
                 record_identifier,
                 entry: updated_entry,
-            }]),
-            explanation: Explanation::new("proposal duplicates an existing forward arrow"),
+            }],
+            explanation: "proposal duplicates an existing forward arrow".into(),
         }))
     }
 
@@ -653,7 +759,14 @@ impl Store {
         let mut records = self
             .records()?
             .into_iter()
-            .filter(|record| EntryStoreExt::matches(&record.entry, query))
+            .filter(|record| match query {
+                Query::Observe(selection)
+                | Query::Count(selection)
+                | Query::SubscribeIntent(selection) => {
+                    EntryStoreExt::matches(&record.entry, selection)
+                }
+                _ => false,
+            })
             .collect::<Vec<_>>();
         records.sort_by_key(|record| std::cmp::Reverse(record.entry.importance_rank()));
         Ok(records
@@ -671,7 +784,7 @@ impl Store {
             .into_iter()
             .filter(|record| query.matches_entry(&record.entry))
         {
-            if seen.insert(record.record_identifier.payload().clone()) {
+            if seen.insert(record.record_identifier.clone()) {
                 records.push(record.into_observed_record());
             }
         }
@@ -715,7 +828,7 @@ impl Store {
         match operation {
             GuardianOperation::Clarify(clarification) => {
                 if let Some(current) =
-                    self.observed_record_by_identifier(clarification.record_identifier.payload())?
+                    self.observed_record_by_identifier(&clarification.record_identifier)?
                 {
                     bundle.insert(current.clone());
                     let mut candidate = current.entry;
@@ -724,17 +837,14 @@ impl Store {
                 }
             }
             GuardianOperation::ResolveClarification(resolution) => {
-                if let Some(current) = self.observed_record_by_identifier(
-                    resolution
-                        .clarification_record_identifier
-                        .payload()
-                        .payload(),
-                )? {
+                if let Some(current) =
+                    self.observed_record_by_identifier(&resolution.clarification_record_identifier)?
+                {
                     bundle.insert(current);
                 }
-                for target in resolution.target_clarifications.payload() {
+                for target in &resolution.target_clarifications {
                     if let Some(current) =
-                        self.observed_record_by_identifier(target.record_identifier.payload())?
+                        self.observed_record_by_identifier(&target.record_identifier)?
                     {
                         bundle.insert(current.clone());
                         let mut candidate = current.entry;
@@ -744,24 +854,22 @@ impl Store {
                 }
             }
             GuardianOperation::Supersede(supersession) => {
-                for retired_identifier in supersession.retired_identifiers.payload() {
-                    if let Some(current) =
-                        self.observed_record_by_identifier(retired_identifier.payload().payload())?
-                    {
+                for retired_identifier in &supersession.retired_identifiers {
+                    if let Some(current) = self.observed_record_by_identifier(retired_identifier)? {
                         bundle.insert(current);
                     }
                 }
             }
             GuardianOperation::Retire(retirement) => {
                 if let Some(current) =
-                    self.observed_record_by_identifier(retirement.record_identifier.payload())?
+                    self.observed_record_by_identifier(&retirement.record_identifier)?
                 {
                     bundle.insert(current);
                 }
             }
             GuardianOperation::ChangeRecord(change) => {
                 if let Some(current) =
-                    self.observed_record_by_identifier(change.record_identifier.payload())?
+                    self.observed_record_by_identifier(&change.record_identifier)?
                 {
                     bundle.insert(current);
                 }
@@ -774,10 +882,8 @@ impl Store {
     #[cfg(feature = "agent-guardian")]
     fn guardian_records_for_entry(&self, proposed: &Entry) -> Result<RecordSet, StoreError> {
         let mut bundle = GuardianRecordBundle::new();
-        for scope in proposed.guardian_domain_scopes().into_payload() {
-            bundle.extend(RecordSet::new(
-                self.observe(&Query::guardian_domain_scope(scope))?,
-            ));
+        for scope in proposed.guardian_domain_scopes() {
+            bundle.extend(self.observe(&Query::Observe(Selection::guardian_domain_scope(scope)))?);
         }
         Ok(bundle.into_record_set())
     }
@@ -804,9 +910,8 @@ impl Store {
                 && record
                     .entry
                     .description
-                    .payload()
                     .trim()
-                    .eq_ignore_ascii_case(proposed.description.payload().trim())
+                    .eq_ignore_ascii_case(proposed.description.trim())
         }))
     }
 
@@ -821,22 +926,20 @@ impl Store {
         };
         let record_identifier = duplicate.record_identifier.clone();
         let _importance_receipt = self
-            .bump_importance(ImportanceBump::new(record_identifier.clone()))?
-            .ok_or_else(|| {
-                StoreError::DuplicateRecordVanished(record_identifier.payload().clone())
-            })?;
+            .bump_importance(ImportanceBump {
+                record_identifier: record_identifier.clone(),
+            })?
+            .ok_or_else(|| StoreError::DuplicateRecordVanished(record_identifier.clone()))?;
         let updated_entry = self
-            .entry_by_identifier(record_identifier.payload())?
-            .ok_or_else(|| {
-                StoreError::DuplicateRecordVanished(record_identifier.payload().clone())
-            })?;
+            .entry_by_identifier(&record_identifier)?
+            .ok_or_else(|| StoreError::DuplicateRecordVanished(record_identifier.clone()))?;
         Ok(GuardianRejection {
             guardian_rejection_reason: GuardianRejectionReason::Duplicate,
-            record_set: RecordSet::new(vec![ObservedRecord {
+            record_set: vec![ObservedRecord {
                 record_identifier,
                 entry: updated_entry,
-            }]),
-            explanation: Explanation::new("guardian judged the write as a duplicate"),
+            }],
+            explanation: "guardian judged the write as a duplicate".into(),
         })
     }
 
@@ -867,30 +970,30 @@ impl Store {
 
     pub fn retire(&self, retirement: Retirement) -> Result<Option<RetirementReceipt>, StoreError> {
         let record_identifier = retirement.record_identifier;
-        let Some(entry) = self.entry_by_identifier(record_identifier.payload())? else {
+        let Some(entry) = self.entry_by_identifier(&record_identifier)? else {
             return Ok(None);
         };
         let mut archive = self.open_archive_database()?;
         archive.archive_record(
-            StoredRecord::new(record_identifier.payload().clone(), entry),
-            self.archive_identifier(record_identifier.payload()),
+            StoredRecord::new(record_identifier.clone(), entry),
+            self.archive_identifier(&record_identifier),
         )?;
-        if !self.remove(record_identifier.payload())? {
+        if !self.remove(&record_identifier)? {
             return Ok(None);
         }
-        Ok(Some(RetirementReceipt::new(record_identifier)))
+        Ok(Some(RetirementReceipt { record_identifier }))
     }
 
     fn bump_importance(
         &self,
         change: ImportanceBump,
     ) -> Result<Option<ImportanceBumpReceipt>, StoreError> {
-        let record_identifier = change.into_payload();
-        let identifier_text = record_identifier.payload().clone();
-        let Some(mut entry) = self.entry_by_identifier(record_identifier.payload())? else {
+        let record_identifier = change.record_identifier;
+        let identifier_text = record_identifier.clone();
+        let Some(mut entry) = self.entry_by_identifier(&record_identifier)? else {
             return Ok(None);
         };
-        entry.importance = entry.importance.next();
+        entry.importance = MagnitudeStoreExt::next(&entry.importance);
         let importance = entry.importance.clone();
         self.database.mutate(Mutation::new(
             self.entries,
@@ -907,11 +1010,8 @@ impl Store {
         change: RecordChange,
     ) -> Result<Option<RecordChangeReceipt>, StoreError> {
         let record_identifier = change.record_identifier;
-        let identifier_text = record_identifier.payload().clone();
-        if self
-            .entry_by_identifier(record_identifier.payload())?
-            .is_none()
-        {
+        let identifier_text = record_identifier.clone();
+        if self.entry_by_identifier(&record_identifier)?.is_none() {
             return Ok(None);
         }
         let entry = change.entry;
@@ -919,29 +1019,29 @@ impl Store {
             self.entries,
             StoredRecord::new(identifier_text, entry),
         ))?;
-        Ok(Some(RecordChangeReceipt::new(record_identifier)))
+        Ok(Some(RecordChangeReceipt { record_identifier }))
     }
 
     pub fn clarify(
         &self,
-        clarification: Clarification,
+        clarification: ClarificationRequest,
     ) -> Result<Option<ClarificationReceipt>, StoreError> {
         let record_identifier = clarification.record_identifier;
-        let identifier_text = record_identifier.payload().clone();
-        let Some(mut entry) = self.entry_by_identifier(record_identifier.payload())? else {
+        let identifier_text = record_identifier.clone();
+        let Some(mut entry) = self.entry_by_identifier(&record_identifier)? else {
             return Ok(None);
         };
         let mut archive = self.open_archive_database()?;
         archive.archive_record(
             StoredRecord::new(identifier_text.clone(), entry.clone()),
-            self.archive_identifier(record_identifier.payload()),
+            self.archive_identifier(&record_identifier),
         )?;
         entry.description = clarification.description;
         self.database.mutate(Mutation::new(
             self.entries,
             StoredRecord::new(identifier_text, entry),
         ))?;
-        Ok(Some(ClarificationReceipt::new(record_identifier)))
+        Ok(Some(ClarificationReceipt { record_identifier }))
     }
 
     pub fn resolve_clarification(
@@ -953,7 +1053,7 @@ impl Store {
             target_clarifications,
             justification: _justification,
         } = resolution;
-        let clarification_identifier = clarification_record_identifier.payload().payload().clone();
+        let clarification_identifier = clarification_record_identifier.clone();
         if self
             .entry_by_identifier(&clarification_identifier)?
             .is_none()
@@ -962,8 +1062,8 @@ impl Store {
         }
 
         let mut snapshots = Vec::new();
-        for target in target_clarifications.payload() {
-            let identifier_text = target.record_identifier.payload().clone();
+        for target in target_clarifications {
+            let identifier_text = target.record_identifier.clone();
             let Some(entry) = self.entry_by_identifier(&identifier_text)? else {
                 return Ok(None);
             };
@@ -998,10 +1098,8 @@ impl Store {
         }
 
         Ok(Some(ClarificationResolutionReceipt {
-            clarification_record_identifier: ClarificationRecordIdentifier::new(
-                RecordIdentifier::new(clarification_identifier),
-            ),
-            record_identifiers: RecordIdentifiers::new(record_identifiers),
+            clarification_record_identifier: clarification_identifier,
+            record_identifiers,
         }))
     }
 
@@ -1014,8 +1112,8 @@ impl Store {
         // Snapshot every retired target up front, BEFORE any mutation, so a
         // missing target is a clean no-op rather than a partial write.
         let mut snapshots = Vec::new();
-        for identifier in retired_identifiers.payload() {
-            let identifier_text = identifier.payload().payload().clone();
+        for identifier in &retired_identifiers {
+            let identifier_text = identifier.clone();
             let Some(entry) = self.entry_by_identifier(&identifier_text)? else {
                 return Ok(None);
             };
@@ -1029,7 +1127,7 @@ impl Store {
         // (an extra record), never a loss; a single sema-engine WriteTransaction
         // spanning the whole supersede is the eventual end state.
         let mut record_identifiers = Vec::new();
-        for replacement in replacements.into_payload() {
+        for replacement in replacements {
             let sema_receipt = self.propose(replacement)?;
             record_identifiers.push(sema_receipt.record_identifier);
         }
@@ -1047,7 +1145,7 @@ impl Store {
         }
         Ok(Some(SupersessionReceipt {
             retired_identifiers,
-            record_identifiers: RecordIdentifiers::new(record_identifiers),
+            record_identifiers,
         }))
     }
 
@@ -1067,10 +1165,9 @@ impl Store {
     /// content hash of the committed records.
     pub fn database_marker(&self) -> DatabaseMarker {
         DatabaseMarker {
-            commit_sequence: crate::schema::signal::CommitSequence::new(
-                self.commit_sequence().unwrap_or(0),
-            ),
-            state_digest: crate::schema::signal::StateDigest::new(self.state_digest().unwrap_or(0)),
+            commit_sequence: i64::try_from(self.commit_sequence().unwrap_or(0))
+                .expect("commit sequence fits i64"),
+            state_digest: wire_state_digest(self.state_digest().unwrap_or(0)),
         }
     }
 
@@ -1094,7 +1191,7 @@ impl Store {
         for record in records {
             let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&record)
                 .map_err(|_| StoreError::ArchiveEncode)?;
-            hasher.update(record.record_identifier.payload().as_bytes());
+            hasher.update(record.record_identifier.as_bytes());
             hasher.update(&archive);
         }
         let digest = hasher.finalize();
@@ -1116,10 +1213,24 @@ impl Store {
     }
 }
 
+impl From<SpiritNexusConfiguration> for StoredNexusConfiguration {
+    fn from(configuration: SpiritNexusConfiguration) -> Self {
+        Self {
+            state: nexus::ConfigurationState::from_default(configuration),
+        }
+    }
+}
+
+impl EngineRecord for StoredNexusConfiguration {
+    fn record_key(&self) -> RecordKey {
+        RecordKey::new("nexus-configuration")
+    }
+}
+
 impl StoredRecord {
     pub(super) fn new(record_identifier: String, entry: Entry) -> Self {
         Self {
-            record_identifier: RecordIdentifier::new(record_identifier),
+            record_identifier,
             entry,
         }
     }
@@ -1138,7 +1249,7 @@ impl StoredRecord {
 
 impl EngineRecord for StoredRecord {
     fn record_key(&self) -> RecordKey {
-        RecordKey::new(self.record_identifier.payload().clone())
+        RecordKey::new(self.record_identifier.clone())
     }
 }
 
@@ -1150,14 +1261,11 @@ pub trait GuardianEntryExt {
 #[cfg(feature = "agent-guardian")]
 impl GuardianEntryExt for Entry {
     fn guardian_domain_scopes(&self) -> DomainScopes {
-        DomainScopes::new(
-            self.domains
-                .payload()
-                .iter()
-                .cloned()
-                .map(DomainScope::from)
-                .collect(),
-        )
+        self.domains
+            .iter()
+            .cloned()
+            .map(|domain| DomainScope { domain })
+            .collect()
     }
 }
 
@@ -1168,9 +1276,9 @@ pub trait GuardianQueryExt {
 }
 
 #[cfg(feature = "agent-guardian")]
-impl GuardianQueryExt for Query {
+impl GuardianQueryExt for crate::schema::signal::Selection {
     fn guardian_domain_scope(scope: DomainScope) -> Self {
-        Self::guardian_context(DomainMatch::full(DomainScopes::new(vec![scope])))
+        Self::guardian_context(DomainMatch::Full(vec![scope]))
     }
 
     fn guardian_context(domain_match: DomainMatch) -> Self {
@@ -1178,7 +1286,7 @@ impl GuardianQueryExt for Query {
             domain_match,
             keyword_match: KeywordMatch::Any,
             text_match: TextMatch::Any,
-            selected_kind: SelectedKind::new(None),
+            selected_kind: None,
             importance_selection: ImportanceSelection::default_observation_importance(),
         }
     }
@@ -1196,16 +1304,15 @@ impl IntentQuery {
 
     fn matches_entry(&self, entry: &Entry) -> bool {
         self.requested_scopes
-            .payload()
             .iter()
             .any(|requested_scope| self.matches_requested_scope(entry, requested_scope))
     }
 
     fn matches_requested_scope(&self, entry: &Entry, requested_scope: &DomainScope) -> bool {
-        entry.domains.payload().iter().any(|record_domain| {
-            requested_scope.expand().matches_domain(record_domain)
-                || DomainScope::from(record_domain.clone()).matches_scope(requested_scope)
-        })
+        entry
+            .domains
+            .iter()
+            .any(|record_domain| domain_scope_matches(&requested_scope.domain, record_domain))
     }
 }
 
@@ -1216,7 +1323,7 @@ struct TextSearchNeedle {
 
 impl TextSearchNeedle {
     fn new(search_text: &SearchText) -> Self {
-        let words = Self::normalized_words(search_text.payload());
+        let words = Self::normalized_words(search_text);
         let empty = words.is_empty();
         Self { words, empty }
     }
@@ -1226,10 +1333,10 @@ impl TextSearchNeedle {
     }
 
     fn normalized_words(search_text: &str) -> Vec<String> {
-        QuerySearchText::new(search_text)
-            .words
-            .into_iter()
-            .map(|word| word.as_str().to_owned())
+        search_text
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
             .collect()
     }
 
@@ -1239,19 +1346,18 @@ impl TextSearchNeedle {
     }
 
     fn score_description(&self, description: &Description) -> u64 {
-        self.score_text(description.payload(), 100, 10)
+        self.score_text(description, 100, 10)
     }
 
     fn score_text(&self, text: &str, phrase_score: u64, word_score: u64) -> u64 {
-        let haystack = QuerySearchText::new(text);
+        let normalized = text.to_lowercase();
+        let normalized_words = Self::normalized_words(text);
         let mut score = 0;
-        let phrase_query = TextQuery::contains(QueryTerm::phrase(self.words.clone()));
-        if matches!(phrase_query.find_in(&haystack), SearchOutcome::Matched(_)) {
+        if !self.words.is_empty() && normalized.contains(&self.words.join(" ")) {
             score += phrase_score;
         }
         for word in &self.words {
-            let query = TextQuery::contains(QueryTerm::word(word.clone()));
-            if matches!(query.find_in(&haystack), SearchOutcome::Matched(_)) {
+            if normalized_words.iter().any(|candidate| candidate == word) {
                 score += word_score;
             }
         }
@@ -1267,29 +1373,33 @@ impl DomainStoreExt for Domain {
     fn to_signal_domain(&self) -> Option<signal_domain::Domain> {
         match self {
             Domain::All => None,
-            Domain::Health(payload) => Some(signal_domain::Domain::Health(*payload)),
-            Domain::Food(payload) => Some(signal_domain::Domain::Food(*payload)),
-            Domain::Home(payload) => Some(signal_domain::Domain::Home(*payload)),
-            Domain::Finance(payload) => Some(signal_domain::Domain::Finance(*payload)),
-            Domain::Work(payload) => Some(signal_domain::Domain::Work(*payload)),
-            Domain::Craft(payload) => Some(signal_domain::Domain::Craft(*payload)),
-            Domain::Knowledge(payload) => Some(signal_domain::Domain::Knowledge(*payload)),
-            Domain::Education(payload) => Some(signal_domain::Domain::Education(*payload)),
-            Domain::Language(payload) => Some(signal_domain::Domain::Language(*payload)),
-            Domain::Art(payload) => Some(signal_domain::Domain::Art(*payload)),
-            Domain::Kinship(payload) => Some(signal_domain::Domain::Kinship(*payload)),
-            Domain::Selfhood(payload) => Some(signal_domain::Domain::Selfhood(*payload)),
-            Domain::Spirituality(payload) => Some(signal_domain::Domain::Spirituality(*payload)),
-            Domain::Governance(payload) => Some(signal_domain::Domain::Governance(*payload)),
-            Domain::Law(payload) => Some(signal_domain::Domain::Law(*payload)),
-            Domain::Community(payload) => Some(signal_domain::Domain::Community(*payload)),
-            Domain::Nature(payload) => Some(signal_domain::Domain::Nature(*payload)),
-            Domain::Travel(payload) => Some(signal_domain::Domain::Travel(*payload)),
-            Domain::Commerce(payload) => Some(signal_domain::Domain::Commerce(*payload)),
-            Domain::Leisure(payload) => Some(signal_domain::Domain::Leisure(*payload)),
-            Domain::Appearance(payload) => Some(signal_domain::Domain::Appearance(*payload)),
-            Domain::Safety(payload) => Some(signal_domain::Domain::Safety(*payload)),
-            Domain::Information(payload) => Some(signal_domain::Domain::Information(*payload)),
+            Domain::Health(payload) => Some(signal_domain::Domain::Health(payload.clone())),
+            Domain::Food(payload) => Some(signal_domain::Domain::Food(payload.clone())),
+            Domain::Home(payload) => Some(signal_domain::Domain::Home(payload.clone())),
+            Domain::Finance(payload) => Some(signal_domain::Domain::Finance(payload.clone())),
+            Domain::Work(payload) => Some(signal_domain::Domain::Work(payload.clone())),
+            Domain::Craft(payload) => Some(signal_domain::Domain::Craft(payload.clone())),
+            Domain::Knowledge(payload) => Some(signal_domain::Domain::Knowledge(payload.clone())),
+            Domain::Education(payload) => Some(signal_domain::Domain::Education(payload.clone())),
+            Domain::Language(payload) => Some(signal_domain::Domain::Language(payload.clone())),
+            Domain::Art(payload) => Some(signal_domain::Domain::Art(payload.clone())),
+            Domain::Kinship(payload) => Some(signal_domain::Domain::Kinship(payload.clone())),
+            Domain::Selfhood(payload) => Some(signal_domain::Domain::Selfhood(payload.clone())),
+            Domain::Spirituality(payload) => {
+                Some(signal_domain::Domain::Spirituality(payload.clone()))
+            }
+            Domain::Governance(payload) => Some(signal_domain::Domain::Governance(payload.clone())),
+            Domain::Law(payload) => Some(signal_domain::Domain::Law(payload.clone())),
+            Domain::Community(payload) => Some(signal_domain::Domain::Community(payload.clone())),
+            Domain::Nature(payload) => Some(signal_domain::Domain::Nature(payload.clone())),
+            Domain::Travel(payload) => Some(signal_domain::Domain::Travel(payload.clone())),
+            Domain::Commerce(payload) => Some(signal_domain::Domain::Commerce(payload.clone())),
+            Domain::Leisure(payload) => Some(signal_domain::Domain::Leisure(payload.clone())),
+            Domain::Appearance(payload) => Some(signal_domain::Domain::Appearance(payload.clone())),
+            Domain::Safety(payload) => Some(signal_domain::Domain::Safety(payload.clone())),
+            Domain::Information(payload) => {
+                Some(signal_domain::Domain::Information(payload.clone()))
+            }
             Domain::Technology(payload) => Some(signal_domain::Domain::Technology(payload.clone())),
         }
     }
@@ -1301,50 +1411,70 @@ impl DomainStoreExt for Domain {
 // equivalence expansion through `DomainScope::expand`, and
 // `DomainScopes::matches_any_domain`), and spirit consumes it directly.
 
+/// State digests are opaque 64-bit hash identities.  The signal contract's
+/// signed integer field carries the same 64 bits; it is never used for
+/// arithmetic or ordering.
+fn wire_state_digest(digest: u64) -> i64 {
+    i64::from_le_bytes(digest.to_le_bytes())
+}
+
+/// Domain matching retains the taxonomy-wide `All` semantics from the prior
+/// domain projection.  A stored data `All` leaf is the parent scope for every
+/// concrete data leaf; exact domains still require equality.
+fn domain_scope_matches(requested: &Domain, recorded: &Domain) -> bool {
+    requested == recorded
+        || matches!(
+            recorded,
+            Domain::All
+                | Domain::Technology(TechnologyDomain::Software(SoftwareDomain::Data(
+                    DataLeaf::All
+                )))
+        )
+}
+
 pub trait EntryStoreExt {
-    fn matches(&self, query: &Query) -> bool;
+    fn matches(&self, query: &crate::schema::signal::Selection) -> bool;
     fn matches_domain_match(&self, domain_match: &DomainMatch) -> bool;
     fn importance_rank(&self) -> u64;
 }
 
 impl EntryStoreExt for Entry {
-    fn matches(&self, query: &Query) -> bool {
+    fn matches(&self, query: &crate::schema::signal::Selection) -> bool {
         self.matches_domain_match(&query.domain_match)
             && query.keyword_match.matches(&self.description)
             && query.text_match.matches(&self.description)
             && query
                 .selected_kind
-                .payload()
                 .as_ref()
                 .is_none_or(|kind| &self.kind == kind)
             && query.importance_selection.matches(&self.importance)
     }
 
     fn matches_domain_match(&self, domain_match: &DomainMatch) -> bool {
-        if self.domains.payload().contains(&Domain::All) {
+        if self.domains.contains(&Domain::All) {
             return match domain_match {
                 DomainMatch::Any => true,
-                DomainMatch::Partial(scopes) => !scopes.payload().is_empty(),
-                DomainMatch::Full(scopes) => !scopes.payload().is_empty(),
+                DomainMatch::Partial(scopes) => !scopes.is_empty(),
+                DomainMatch::Full(scopes) => !scopes.is_empty(),
             };
         }
         match domain_match {
             DomainMatch::Any => true,
-            DomainMatch::Partial(scopes) => {
-                scopes.payload().matches_any_domain(self.domains.payload())
-            }
-            DomainMatch::Full(scopes) => scopes.payload().iter().all(|scope| {
-                let expanded = scope.expand();
+            DomainMatch::Partial(scopes) => scopes.iter().any(|scope| {
                 self.domains
-                    .payload()
                     .iter()
-                    .any(|domain| expanded.matches_domain(domain))
+                    .any(|domain| domain_scope_matches(&scope.domain, domain))
+            }),
+            DomainMatch::Full(scopes) => scopes.iter().all(|scope| {
+                self.domains
+                    .iter()
+                    .any(|domain| domain_scope_matches(&scope.domain, domain))
             }),
         }
     }
 
     fn importance_rank(&self) -> u64 {
-        self.importance.payload().rank()
+        self.importance.rank()
     }
 }
 
@@ -1361,12 +1491,12 @@ impl DescriptionStoreExt for Description {
         let mut seen = BTreeSet::new();
         let mut inside_keyword = false;
         let mut keyword = String::new();
-        for character in self.payload().chars() {
+        for character in self.chars() {
             if character == '*' {
                 if inside_keyword {
                     let normalized = keyword.trim().to_lowercase();
                     if !normalized.is_empty() && seen.insert(normalized.clone()) {
-                        keywords.push(Keyword::new(normalized));
+                        keywords.push(normalized);
                     }
                     keyword.clear();
                     inside_keyword = false;
@@ -1378,19 +1508,18 @@ impl DescriptionStoreExt for Description {
                 keyword.push(character);
             }
         }
-        Keywords::new(keywords)
+        keywords
     }
 
     fn contains_search_text(&self, search_text: &SearchText) -> bool {
-        self.payload()
-            .to_lowercase()
-            .contains(&search_text.payload().trim().to_lowercase())
+        self.to_lowercase()
+            .contains(&search_text.trim().to_lowercase())
     }
 
     #[cfg(feature = "agent-guardian")]
     fn contains_description_text(&self, other: &Description) -> bool {
-        let other = other.payload().trim();
-        !other.is_empty() && self.contains_search_text(&SearchText::new(other))
+        let other = other.trim();
+        !other.is_empty() && self.contains_search_text(&other.to_owned())
     }
 }
 
@@ -1400,7 +1529,7 @@ pub trait KeywordStoreExt {
 
 impl KeywordStoreExt for Keyword {
     fn normalized(&self) -> String {
-        self.payload().trim().to_lowercase()
+        self.trim().to_lowercase()
     }
 }
 
@@ -1413,21 +1542,17 @@ pub trait KeywordsStoreExt {
 impl KeywordsStoreExt for Keywords {
     fn contains_keyword(&self, expected: &Keyword) -> bool {
         let expected = expected.normalized();
-        self.payload()
-            .iter()
-            .any(|keyword| keyword.normalized() == expected)
+        self.iter().any(|keyword| keyword.normalized() == expected)
     }
 
     fn contains_any(&self, expected: &Keywords) -> bool {
         expected
-            .payload()
             .iter()
             .any(|keyword| self.contains_keyword(keyword))
     }
 
     fn contains_all(&self, expected: &Keywords) -> bool {
         expected
-            .payload()
             .iter()
             .all(|keyword| self.contains_keyword(keyword))
     }
@@ -1437,7 +1562,7 @@ pub trait QueryStoreExt {
     fn matches(&self, entry: &Entry) -> bool;
 }
 
-impl QueryStoreExt for Query {
+impl QueryStoreExt for crate::schema::signal::Selection {
     fn matches(&self, entry: &Entry) -> bool {
         EntryStoreExt::matches(entry, self)
     }
@@ -1451,8 +1576,8 @@ impl KeywordMatchStoreExt for KeywordMatch {
     fn matches(&self, description: &Description) -> bool {
         match self {
             Self::Any => true,
-            Self::AnyKeyword(expected) => description.keywords().contains_any(expected.payload()),
-            Self::AllKeywords(expected) => description.keywords().contains_all(expected.payload()),
+            Self::AnyKeyword(expected) => description.keywords().contains_any(expected),
+            Self::AllKeywords(expected) => description.keywords().contains_all(expected),
         }
     }
 }
@@ -1465,9 +1590,7 @@ impl TextMatchStoreExt for TextMatch {
     fn matches(&self, description: &Description) -> bool {
         match self {
             Self::Any => true,
-            Self::ContainsText(search_text) => {
-                description.contains_search_text(search_text.payload())
-            }
+            Self::ContainsText(search_text) => description.contains_search_text(search_text),
         }
     }
 }
@@ -1483,16 +1606,11 @@ impl ImportanceSelectionStoreExt for ImportanceSelection {
     }
 
     fn matches(&self, importance: &Importance) -> bool {
-        let importance = importance.payload();
         match self {
             Self::Any => true,
-            Self::ExactImportance(expected) => importance == expected.payload().payload(),
-            Self::AtMostImportance(maximum) => {
-                importance.rank() <= maximum.payload().payload().rank()
-            }
-            Self::AtLeastImportance(minimum) => {
-                importance.rank() >= minimum.payload().payload().rank()
-            }
+            Self::ExactImportance(expected) => importance == expected,
+            Self::AtMostImportance(maximum) => importance.rank() <= maximum.rank(),
+            Self::AtLeastImportance(minimum) => importance.rank() >= minimum.rank(),
         }
     }
 }
@@ -1503,7 +1621,7 @@ pub trait ImportanceStoreExt {
 
 impl ImportanceStoreExt for Importance {
     fn next(&self) -> Self {
-        Self::new(self.payload().next())
+        MagnitudeStoreExt::next(self)
     }
 }
 
@@ -1536,5 +1654,55 @@ impl MagnitudeStoreExt for Magnitude {
             Self::High => Self::VeryHigh,
             Self::VeryHigh | Self::Maximum => Self::Maximum,
         }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::{TextSearchNeedle, domain_scope_matches, wire_state_digest};
+    use signal_domain::{DataLeaf, Domain, SoftwareDomain, TechnologyDomain};
+
+    #[test]
+    fn state_digest_preserves_high_bit_hash_identity() {
+        let digest = u64::MAX - 17;
+        assert_eq!(
+            wire_state_digest(digest).to_le_bytes(),
+            digest.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn data_all_is_a_parent_scope_for_concrete_data() {
+        let all = Domain::Technology(TechnologyDomain::Software(SoftwareDomain::Data(
+            DataLeaf::All,
+        )));
+        let concrete = Domain::Technology(TechnologyDomain::Software(SoftwareDomain::Data(
+            DataLeaf::Persistence,
+        )));
+        assert!(domain_scope_matches(&concrete, &all));
+        assert!(!domain_scope_matches(&all, &concrete));
+    }
+
+    #[test]
+    fn text_search_normalizes_unicode_case_and_punctuation() {
+        let needle = TextSearchNeedle::new(&"CAFÉ—Routíng".into());
+        assert_eq!(needle.words, vec!["café", "routíng"]);
+        assert_eq!(needle.score_text("The café routíng guide", 100, 10), 120);
+    }
+
+    #[test]
+    fn text_search_rewards_phrase_then_each_matching_word() {
+        let needle = TextSearchNeedle::new(&"routing protocol".into());
+        assert_eq!(
+            needle.score_text("routing protocol architecture", 100, 10),
+            120
+        );
+        assert_eq!(needle.score_text("protocol before routing", 100, 10), 20);
+    }
+
+    #[test]
+    fn text_search_rejects_empty_or_punctuation_only_needles() {
+        assert!(TextSearchNeedle::new(&"   ".into()).is_empty());
+        assert!(TextSearchNeedle::new(&"---".into()).is_empty());
     }
 }

@@ -97,14 +97,22 @@ fn spirit_has_no_direct_redb_dependency_or_redb_two_runtime_tree() {
 }
 
 #[test]
-fn text_client_surface_has_nota_runtime_dependency() {
+fn nexus_package_has_no_datom_or_protos_text_dependency() {
     let manifest = WorkspaceManifest::from_environment();
-    let tree = manifest.cargo_tree(&["--edges", "normal", "--features", "nota-text"]);
-
+    let tree = manifest.cargo_tree(&["-p", "spirit-nexus", "--edges", "normal"]);
     assert!(
-        CargoTree::new(&tree).contains_package("nota"),
-        "nota-text runtime dependency tree must contain nota:\n{tree}"
+        !CargoTree::new(&tree).contains_package("datom-codec")
+            && !CargoTree::new(&tree).contains_package("protos"),
+        "Nexus must stay binary-only; text dependencies belong to clients:\n{tree}"
     );
+}
+
+#[test]
+fn ordinary_client_owns_datom_text_dependencies() {
+    let manifest = WorkspaceManifest::from_environment();
+    let tree = manifest.cargo_tree(&["-p", "spirit-client", "--edges", "normal"]);
+    assert!(CargoTree::new(&tree).contains_package("datom-codec"));
+    assert!(CargoTree::new(&tree).contains_package("protos"));
 }
 
 #[test]

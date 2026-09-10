@@ -34,19 +34,6 @@ let
   metaSocketPath = "${stateDirectory}/meta-spirit.sock";
   judgeSocketPath = "${stateDirectory}/spirit-judge.sock";
   databasePath = "${stateDirectory}/spirit.sema";
-  configurationPath = "spirit.config.rkyv";
-
-  guardianJudgeConfiguration = "(Some (${judgeSocketPath} None None ${toString judgeTimeoutMilliseconds} None))";
-  daemonConfiguration = pkgs.runCommand "spirit-daemon-configuration" { } ''
-    set -eu
-
-    mkdir -p "$out"
-    ${combinedPackage}/bin/spirit-write-configuration \
-      "(ConfigurationWriteRequest (${socketPath} (Some ${metaSocketPath}) ${databasePath} None Gating ${guardianJudgeConfiguration} $out/${configurationPath}))" \
-      > "$out/configuration-written.dotos"
-    test -s "$out/${configurationPath}"
-  '';
-
   activateState = pkgs.writeShellScript "spirit-activation-state" ''
     set -eu
 
@@ -81,11 +68,10 @@ let
     + "(Some ${judgeSessionReference}) (Some ${pkgs.util-linux}/bin/setsid) "
     + "(Some ${judgeProviderPackage}/bin/codex) None))";
 
-  daemonServiceWrapper = pkgs.writeShellScriptBin "spirit-daemon-service" ''
+  daemonServiceWrapper = pkgs.writeShellScriptBin "spirit-nexus-service" ''
     set -eu
 
-    exec ${combinedPackage}/bin/spirit-daemon \
-      ${daemonConfiguration}/${configurationPath}
+    exec ${combinedPackage}/bin/spirit-nexus
   '';
 
   judgeServiceWrapper = pkgs.writeShellScriptBin "spirit-judge-daemon-service" ''
@@ -100,9 +86,9 @@ let
     exec ${combinedPackage}/bin/spirit "$@"
   '';
 
-  metaSpiritCommandLineWrapper = pkgs.writeShellScriptBin "meta-spirit" ''
+  metaSpiritCommandLineWrapper = pkgs.writeShellScriptBin "spirit-meta" ''
     export SPIRIT_META_SOCKET=${lib.escapeShellArg metaSocketPath}
-    exec ${combinedPackage}/bin/meta-spirit "$@"
+    exec ${combinedPackage}/bin/spirit-meta "$@"
   '';
 in
 assert lib.assertMsg stateDirectoryIsAbsolute
@@ -117,7 +103,6 @@ assert lib.assertMsg stateDirectoryIsDotosAtom
       metaSocketPath
       judgeSocketPath
       databasePath
-      configurationPath
       ;
   };
   packages = {
@@ -127,7 +112,6 @@ assert lib.assertMsg stateDirectoryIsDotosAtom
     judgeProvider = judgeProviderPackage;
   };
   inherit
-    daemonConfiguration
     activateState
     initializeState
     initializeJudgeState

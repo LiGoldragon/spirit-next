@@ -12,45 +12,26 @@ publish      = false
 name = "spirit"
 path = "src/lib.rs"
 
-[[bin]]
-name = "spirit"
-path = "src/bin/spirit.rs"
-required-features = ["nota-text"]
-
-[[bin]]
-name = "meta-spirit"
-path = "src/bin/meta-spirit.rs"
-required-features = ["nota-text"]
-
-[[bin]]
-name = "spirit-daemon"
-path = "src/bin/spirit-daemon.rs"
-
-[[bin]]
-name = "spirit-write-configuration"
-path = "src/bin/spirit-write-configuration.rs"
-required-features = ["nota-text"]
-
-[[bin]]
-name = "spirit-migrate-store"
-path = "src/bin/spirit-migrate-store.rs"
-required-features = ["production-migration"]
-
 [[test]]
 name = "nix_integration"
 path = "tests/nix_integration.rs"
-required-features = ["nota-text"]
+required-features = ["datom-cli"]
 
 [[test]]
 name = "process_boundary"
 path = "tests/process_boundary.rs"
-required-features = ["nota-text"]
+required-features = ["datom-cli"]
+
+[[test]]
+name = "store_migration_v15"
+path = "tests/store_migration_v15.rs"
+required-features = ["production-migration"]
 
 [features]
 default = []
-nota-text = ["dep:nota", "nota-text-query/nota-text", "signal-domain/nota-text", "signal-spirit/nota-text", "meta-signal-spirit/nota-text", "signal-introspect?/nota-text"]
+datom-cli = ["signal-introspect?/datom", "dep:datom-codec", "dep:protos", "signal-spirit/datom", "meta-signal-spirit/datom"]
 agent-guardian = ["dep:signal-spirit-judge"]
-production-migration = ["nota-text"]
+production-migration = ["datom-cli"]
 testing-trace = ["dep:signal-introspect", "dep:signal-persona"]
 # The LIVE criome acceptance gate (the everywhere-gate, Spirit `xhwa` as
 # corrected 2026-07-07): the spirit-side `CriomeAuthorization` option keeps
@@ -64,7 +45,7 @@ testing-trace = ["dep:signal-introspect", "dep:signal-persona"]
 # signal-criome brings the typed authorized-object reference and decision
 # vocabulary the seam speaks. Acceptance gating is deliberately its OWN
 # feature: it must never be compiled out together with shipping.
-criome-gate = ["dep:criome", "dep:signal-criome"]
+criome-gate = ["datom-cli", "dep:criome", "dep:signal-criome"]
 # The gated mirror shipper: ship the (by construction cluster-authorized)
 # versioned log to a sema version-control mirror. OFF by default and
 # deploy-gated. Pulls the `mirror` crate (and its signal-mirror/nota
@@ -139,8 +120,9 @@ path = "tests/cluster_authorization_over_router.rs"
 required-features = ["cluster-authorization-e2e"]
 
 [dependencies]
-nota = { package = "nota", git = "https://github.com/LiGoldragon/nota.git", branch = "main", optional = true }
-rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+datom-codec = { git = "https://github.com/LiGoldragon/datom-codec", rev = "f2cc06858d38a4028c928d33323a6d682e7c222f", optional = true }
+protos = { git = "https://github.com/LiGoldragon/protos", rev = "b543678cfc8609529cea7174eb4af8a64daa54ad", optional = true }
+rkyv = { version = "=0.8.18", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 blake3 = "1"
 getrandom = "0.3"
 # The reusable component-side mirror shipper. Gated entirely on an
@@ -152,7 +134,7 @@ getrandom = "0.3"
 # mirror's own nota-text codec, which the shipper does not use.
 mirror = { git = "https://github.com/LiGoldragon/mirror.git", branch = "main", default-features = false, optional = true }
 sema-engine = { git = "https://github.com/LiGoldragon/sema-engine.git", branch = "main" }
-signal-frame = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main" }
+nexus = { git = "https://github.com/LiGoldragon/nexus.git", rev = "a84bfa960c0d5c02d30048c4bbbc67dfef79a67c" }
 signal-mirror = { git = "https://github.com/LiGoldragon/signal-mirror.git", branch = "main", default-features = false, optional = true }
 # The criome seams (Spirit `xhwa`), gated behind `mirror-shipper`. criome
 # brings the `CriomeClient` synchronous Unix-socket transport the guardian
@@ -160,7 +142,7 @@ signal-mirror = { git = "https://github.com/LiGoldragon/signal-mirror.git", bran
 # typed `AuthorizedObjectReference` the dormant head-authorization seam
 # projects from the post-commit head plus its decision vocabulary. Both pin
 # `branch=main`, so Cargo unifies their shared transitive crates
-# (triad-runtime, sema-engine, nota, signal-frame) with the mirror leg in one
+# (triad-runtime, sema-engine, nota) with the mirror leg in one
 # binary. default-features = false on signal-criome drops its nota-text codec,
 # which the daemon (binary rkyv only) does not use.
 criome = { git = "https://github.com/LiGoldragon/criome.git", branch = "main", optional = true }
@@ -178,7 +160,7 @@ meta-signal-router = { git = "https://github.com/LiGoldragon/meta-signal-router.
 meta-signal-criome = { git = "https://github.com/LiGoldragon/meta-signal-criome.git", branch = "main", default-features = false, optional = true }
 signal-standard = { git = "https://github.com/LiGoldragon/signal-standard.git", branch = "main", default-features = false, optional = true }
 signal-agent = { git = "https://github.com/LiGoldragon/signal-agent.git", branch = "main", optional = true }
-signal-spirit-judge = { git = "https://github.com/LiGoldragon/signal-spirit-judge.git", rev = "4fc339fee6adf3aeed82125aa0de8940bdd1f589", optional = true }
+signal-spirit-judge = { path = "/git/github.com/LiGoldragon/signal-spirit-judge", optional = true }
 # The shared wire contract for the tracing -> introspect slice (report 716):
 # spirit projects its own `TraceEvent` onto `signal_introspect::ComponentTraceEvent`
 # and pushes that contract type over the testing-trace socket, so introspect
@@ -192,23 +174,20 @@ signal-spirit-judge = { git = "https://github.com/LiGoldragon/signal-spirit-judg
 # pulled in ONLY by `testing-trace`: signal-introspect carries a non-optional
 # nota dependency, so leaving it out of the default daemon build keeps
 # nota out of the binary-only runtime tree (the daemon's no-NOTA invariant).
-signal-introspect = { git = "https://github.com/LiGoldragon/signal-introspect.git", branch = "main", default-features = false, optional = true }
+signal-introspect = { git = "https://github.com/LiGoldragon/signal-introspect.git", rev = "6e50a42a7f4e1350cc02be6ad032babee948c54e", default-features = false, optional = true }
 # The `EngineIdentifier` newtype stamped onto each pushed `ComponentTraceEvent`.
 # It is a public field type of the `signal-introspect` contract records but is
 # not re-exported from that crate's root, so spirit pins the same `signal-persona`
 # instance directly to construct it; Cargo unifies it with signal-introspect's.
 # Optional and pulled in only by `testing-trace`, for the same no-NOTA reason.
-signal-persona = { git = "https://github.com/LiGoldragon/signal-persona.git", branch = "main", optional = true }
-signal-domain = { git = "https://github.com/LiGoldragon/signal-domain.git", rev = "801e1c5bcc824c9760e246205826e3c8e962d005", default-features = false }
-signal-spirit = { git = "https://github.com/LiGoldragon/signal-spirit.git", rev = "b37fc963292c157452d06e150296c19005dae3f2" }
-meta-signal-spirit = { git = "https://github.com/LiGoldragon/meta-signal-spirit.git", rev = "009cb6c8ddf985244189a79d554aa5d5c24605c8" }
-nota-text-query = { git = "https://github.com/LiGoldragon/nota-text-query.git", rev = "6140a3e9afe3f81c18a39cb0a11dec4eab68b561", default-features = false }
+signal-persona = { git = "https://github.com/LiGoldragon/signal-persona.git", rev = "740eb20f4850e26daeb48911a230b4aa4993f954", optional = true }
+signal-domain = { git = "https://github.com/LiGoldragon/signal-domain.git", rev = "da553c9557bd650e71c8c897947b35bf8abf22b8", default-features = false }
+signal-spirit = { path = "/git/github.com/LiGoldragon/signal-spirit" }
+meta-signal-spirit = { path = "/git/github.com/LiGoldragon/meta-signal-spirit" }
 thiserror = "2"
-tokio = { version = "1.47", features = ["io-util", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1.47", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 triad-runtime = { git = "https://github.com/LiGoldragon/triad-runtime.git", branch = "main" }
 
-[build-dependencies]
-schema-rust = { package = "schema-rust", git = "https://github.com/LiGoldragon/schema-rust.git", rev = "f3b4563163dd11ba1cbbcca8081701ab7830b8f5" }
 
 [dev-dependencies]
 agent = { git = "https://github.com/LiGoldragon/agent.git", branch = "main", features = ["live-provider"] }
@@ -216,7 +195,6 @@ agent = { git = "https://github.com/LiGoldragon/agent.git", branch = "main", fea
 # gated-shipper test ships to and restores from. Same branches mirror pins, so
 # Cargo unifies them with the `mirror` crate's own dependency instances.
 meta-signal-mirror = { git = "https://github.com/LiGoldragon/meta-signal-mirror.git", branch = "main" }
-schema-language = { git = "https://github.com/LiGoldragon/schema-language.git", rev = "6aae825d668e3f607a2754afa6b7d94e9f246c41" }
 # Typed `SemaOperation` labels for versioned-log shape witnesses.
 signal-sema = { git = "https://github.com/LiGoldragon/signal-sema.git", branch = "main" }
 tempfile = "3"
@@ -224,7 +202,7 @@ tempfile = "3"
 [[test]]
 name = "guardian_live_scenarios"
 path = "tests/guardian_live_scenarios.rs"
-required-features = ["agent-guardian", "signal-agent", "nota-text"]
+required-features = ["agent-guardian", "signal-agent", "datom-cli"]
 
 [[test]]
 name = "guardian_journal_upgrade"
@@ -236,17 +214,13 @@ name = "store_migration_v14"
 path = "tests/store_migration_v14.rs"
 required-features = ["production-migration", "agent-guardian"]
 
-[patch."https://github.com/LiGoldragon/nota-next.git"]
-nota = { package = "nota", git = "https://github.com/LiGoldragon/nota.git", branch = "main" }
-nota-derive = { package = "nota-derive", git = "https://github.com/LiGoldragon/nota.git", branch = "main" }
-
-[patch."https://github.com/LiGoldragon/schema-next.git"]
-schema = { package = "schema", git = "https://github.com/LiGoldragon/schema.git", rev = "92bed64ad644ce4caa2827398ada5b7b79221165" }
-schema-cc = { package = "schema-cc", git = "https://github.com/LiGoldragon/schema.git", rev = "92bed64ad644ce4caa2827398ada5b7b79221165" }
-
 
 
 [lints.rust]
 unsafe_code = "forbid"
 unused      = { level = "warn", priority = -1 }
 dead_code   = "warn"
+
+[workspace]
+members = ["crates/spirit-nexus", "crates/spirit-client", "crates/spirit-meta-client", "crates/spirit-offline-tools"]
+resolver = "2"

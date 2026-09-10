@@ -2,19 +2,24 @@ use std::{collections::HashMap, convert::Infallible, sync::Mutex as StdMutex};
 
 #[cfg(feature = "mirror-shipper")]
 use crate::shipper::{MirrorShipper, MirrorShipperError};
+use meta_signal_spirit::Response as MetaResponse;
+use nexus::Configurable as _;
+use signal_spirit::{Query, Response};
+type Integer = i64;
+
 use crate::{
+    config::Configuration,
     nexus::Nexus,
     schema::{
         meta_signal::{
             ConfigureReceipt, ConfigureRejection, ConfigureRejectionReason, ConfigureRequest,
-            HeadDigestHex, HeadObjectHex, ImportReceipt, ImportRequest, Output as MetaOutput,
-            SelectedHeadDigest, SelectedHeadObject, VersionedLogHead, VersionedLogHeadObject,
+            ImportReceipt, ImportRequest, VersionedLogHead, VersionedLogHeadObject,
         },
         nexus::{self as nexus_schema, NexusAction, NexusEngine, NexusWork},
         sema::ErrorReport,
         signal::{
-            self as signal_schema, DatabaseMarker, ErrorMessage, Input, Integer, IntentEvent,
-            Output, RecordCount, SemaReceipt, SupersessionReceipt, ValidationError,
+            self as signal_schema, DatabaseMarker, IntentEvent, SemaReceipt, SupersessionReceipt,
+            ValidationError,
         },
     },
     store::{Store, StoreError},
@@ -96,8 +101,11 @@ pub struct SignalResponse<Root> {
     root: Root,
 }
 
-#[cfg_attr(feature = "nota-text", derive(nota::NotaDecode, nota::NotaEncode))]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "datom-cli",
+    derive(datom_codec::Datomizable, datom_codec::Compositional)
+)]
 pub enum SignalObjectName {
     Started,
     Stopped,
@@ -225,7 +233,7 @@ impl<Root> MessageProcessed<Root> {
     }
 }
 
-impl MessageProcessed<Output> {
+impl MessageProcessed<Response> {
     pub fn processed_mail_event(&self) -> MailLedgerEvent {
         MailLedgerEvent::processed(ProcessedMail {
             mail_identifier: MailIdentifier::new(self.identifier().as_integer()),
@@ -346,16 +354,16 @@ pub struct Engine {
 #[cfg(feature = "criome-gate")]
 #[derive(Debug)]
 pub enum StagedIntake {
-    Completed(Output),
+    Completed(Response),
     Parked(crate::criome_gate::StagedHeadAdvance),
 }
 
-/// The closed Output → staged-group-fate contact point (§3.5.1): an ACCEPTING
+/// The closed Response → staged-group-fate contact point (§3.5.1): an ACCEPTING
 /// reply is the held acceptance of a head-advancing operation, so its staged
 /// group opens a round and materializes on the grant; every other reply
 /// refuses or answers without appending, so its staged buffer is abandoned —
 /// nothing recorded anywhere. The match is exhaustive on purpose: a new
-/// Output variant must choose its fate here before spirit compiles.
+/// Response variant must choose its fate here before spirit compiles.
 #[cfg(feature = "criome-gate")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReplyFate {
@@ -365,42 +373,44 @@ enum ReplyFate {
 
 #[cfg(feature = "criome-gate")]
 impl ReplyFate {
-    fn of(output: &Output) -> Self {
+    fn of(output: &Response) -> Self {
         match output {
-            Output::RecordAccepted(_)
-            | Output::Proposed(_)
-            | Output::Clarified(_)
-            | Output::ClarificationResolved(_)
-            | Output::Superseded(_)
-            | Output::Retired(_)
-            | Output::ImportanceBumped(_)
-            | Output::RecordChanged(_) => Self::Accepting,
+            Response::RecordAccepted(_)
+            | Response::Proposed(_)
+            | Response::Clarified(_)
+            | Response::ClarificationResolved(_)
+            | Response::Superseded(_)
+            | Response::Retired(_)
+            | Response::ImportanceBumped(_)
+            | Response::RecordChanged(_) => Self::Accepting,
             // `RecordApplied` is the §4 acceptance-by-verification reply: the
             // carried authorization already gated that state cluster-wide, so
             // an apply never opens an intake round (and today's nexus answers
             // the apply ingress fail-closed, never producing it).
-            Output::Error(_)
-            | Output::Rejected(_)
-            | Output::GuardianRejected(_)
-            | Output::ApplyRefused(_)
-            | Output::AdvanceRefused(_)
-            | Output::RecordApplied(_)
-            | Output::RecordsObserved(_)
-            | Output::RecordsStashed(_)
-            | Output::RecordFound(_)
-            | Output::RecordsCounted(_)
-            | Output::SubscriptionStarted(_)
-            | Output::ObservationTapped(_)
-            | Output::ObservationUntapped(_)
-            | Output::Event(_)
-            | Output::VersionReported(_)
-            | Output::MarkerReported(_) => Self::NonAccepting,
+            Response::ConfigurationAccepted(_)
+            | Response::ConfigurationRefused(_)
+            | Response::Error(_)
+            | Response::Rejected(_)
+            | Response::GuardianRejected(_)
+            | Response::ApplyRefused(_)
+            | Response::AdvanceRefused(_)
+            | Response::RecordApplied(_)
+            | Response::RecordsObserved(_)
+            | Response::RecordsStashed(_)
+            | Response::RecordFound(_)
+            | Response::RecordsCounted(_)
+            | Response::SubscriptionStarted(_)
+            | Response::ObservationTapped(_)
+            | Response::ObservationUntapped(_)
+            | Response::Event(_)
+            | Response::VersionReported(_)
+            | Response::MarkerReported(_) => Self::NonAccepting,
         }
     }
 }
 
 /// The Signal admission gate: the request-admission plane that mints the
-/// origin route, issues a message identifier, and validates a wire `Input`
+/// origin route, issues a message identifier, and validates a wire `Query`
 /// before any deeper layer sees it, plus the `SignalEngine` triage / reply
 /// translation between the Signal and Nexus planes.
 ///
@@ -418,7 +428,7 @@ pub struct SignalAdmission {
 
 #[derive(Debug)]
 pub struct SignalAccepted {
-    input: Input,
+    input: Query,
     origin_route: OriginRoute,
     sent: MessageSent,
 }
@@ -523,14 +533,14 @@ impl Engine {
     }
 
     pub fn set_authorization_mode(&mut self, authorization_mode: signal_spirit::AuthorizationMode) {
-        self.authorization_mode = authorization_mode;
+        self.authorization_mode = authorization_mode.clone();
         #[cfg(all(feature = "agent-guardian", feature = "criome-gate"))]
         self.nexus
             .set_operation_authorization_mode(authorization_mode);
     }
 
     pub fn authorization_mode(&self) -> signal_spirit::AuthorizationMode {
-        self.authorization_mode
+        self.authorization_mode.clone()
     }
 
     /// Run one request through Signal admission, the NexusEngine
@@ -540,7 +550,7 @@ impl Engine {
     /// identifier, and validates) before any deeper layer sees it. The
     /// sent hook fires at the Signal→Nexus handoff; the processed hook
     /// fires after the NexusEngine returns its reply.
-    pub fn handle(&mut self, input: Input) -> SignalResponse<Output> {
+    pub fn handle(&mut self, input: Query) -> SignalResponse<Response> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -548,7 +558,7 @@ impl Engine {
             .block_on(self.handle_async(input))
     }
 
-    pub async fn handle_async(&mut self, input: Input) -> SignalResponse<Output> {
+    pub async fn handle_async(&mut self, input: Query) -> SignalResponse<Response> {
         let accepted = match self.signal_admission.admit(input) {
             Ok(accepted) => accepted,
             Err(rejected) => {
@@ -644,7 +654,7 @@ impl Engine {
     /// database is opened lazily later, not here — so this always replies
     /// `Configured`. The `ConfigureRejection` / `ArchiveTargetUnwritable` arm of
     /// the contract is reserved for a future eager-validation policy.
-    pub fn configure(&mut self, request: ConfigureRequest) -> MetaOutput {
+    pub fn configure(&mut self, request: ConfigureRequest) -> MetaResponse {
         // `ConfigureRequest` is now a named-field struct carrying both the
         // archive target and an optional mirror target. The field plumbing is
         // unconditional so the DEFAULT build (where the gated shipper module is
@@ -655,10 +665,38 @@ impl Engine {
             selected_mirror_target,
             selected_criome_gate_target,
             selected_guardian_prompt_target,
+            spirit_nexus_configuration,
         } = request;
-        let mirror_target = selected_mirror_target.into_payload();
-        let criome_gate_target = selected_criome_gate_target.into_payload();
-        let guardian_prompt_target = selected_guardian_prompt_target.into_payload();
+        let mirror_target = selected_mirror_target;
+        let criome_gate_target = selected_criome_gate_target;
+        let guardian_prompt_target = selected_guardian_prompt_target;
+        let mut configuration_state = match self.nexus.store().nexus_configuration_state() {
+            Ok(state) => state,
+            Err(_) => {
+                return MetaResponse::Rejected(ConfigureRejection {
+                    configure_rejection_reason: ConfigureRejectionReason::InternalError,
+                    database_marker: self.nexus.database_marker(),
+                });
+            }
+        };
+        if Configuration::validate_nexus_configuration(&spirit_nexus_configuration).is_err() {
+            return MetaResponse::Rejected(ConfigureRejection {
+                configure_rejection_reason: ConfigureRejectionReason::InternalError,
+                database_marker: self.nexus.database_marker(),
+            });
+        }
+        configuration_state.meta_configure(spirit_nexus_configuration.clone());
+        if self
+            .nexus
+            .store()
+            .replace_nexus_configuration(configuration_state.clone())
+            .is_err()
+        {
+            return MetaResponse::Rejected(ConfigureRejection {
+                configure_rejection_reason: ConfigureRejectionReason::InternalError,
+                database_marker: self.nexus.database_marker(),
+            });
+        }
         self.nexus
             .set_archive_target(archive_database_target.clone());
         // GuardianPromptTarget remains in the owner-only meta contract for
@@ -676,7 +714,7 @@ impl Engine {
             .configure(mirror_target.as_ref(), self.nexus.store().engine_handle())
         {
             let _ = error;
-            return MetaOutput::rejected(ConfigureRejection {
+            return MetaResponse::Rejected(ConfigureRejection {
                 configure_rejection_reason: ConfigureRejectionReason::InternalError,
                 database_marker: self.nexus.database_marker(),
             });
@@ -691,7 +729,7 @@ impl Engine {
         {
             match &criome_gate_target {
                 Some(crate::schema::meta_signal::CriomeGateTarget::Socket(socket_path)) => {
-                    let socket = socket_path.payload().payload().clone();
+                    let socket = socket_path.criome_socket_path_text.clone();
                     self.criome_gate.set_authorization(
                         crate::criome_gate::CriomeAuthorization::Enabled(
                             crate::criome_gate::ClusterAuthorizer::new(socket.clone()),
@@ -710,13 +748,45 @@ impl Engine {
             #[cfg(feature = "mirror-shipper")]
             self.rebuild_propagation();
         }
-        MetaOutput::configured(ConfigureReceipt::new(
+        MetaResponse::Configured(ConfigureReceipt {
+            spirit_nexus_configuration,
             archive_database_target,
-            mirror_target,
-            criome_gate_target,
-            guardian_prompt_target,
-            self.nexus.database_marker(),
-        ))
+            selected_mirror_target: mirror_target,
+            selected_criome_gate_target: criome_gate_target,
+            selected_guardian_prompt_target: guardian_prompt_target,
+            database_marker: self.nexus.database_marker(),
+            meta_configure_done: configuration_state.meta_configure_occurred(),
+        })
+    }
+
+    /// Clear only the truthful meta-Configure marker. The desired configuration
+    /// remains persisted and ordinary Configure becomes available again.
+    pub fn reverse_meta_configuration(&mut self) -> MetaResponse {
+        let mut state = match self.nexus.store().nexus_configuration_state() {
+            Ok(state) => state,
+            Err(_) => {
+                return MetaResponse::Rejected(ConfigureRejection {
+                    configure_rejection_reason: ConfigureRejectionReason::InternalError,
+                    database_marker: self.nexus.database_marker(),
+                });
+            }
+        };
+        state.meta_reverse();
+        if self
+            .nexus
+            .store()
+            .replace_nexus_configuration(state.clone())
+            .is_err()
+        {
+            return MetaResponse::Rejected(ConfigureRejection {
+                configure_rejection_reason: ConfigureRejectionReason::InternalError,
+                database_marker: self.nexus.database_marker(),
+            });
+        }
+        MetaResponse::OrdinaryConfigurationReopened(meta_signal_spirit::ConfigurationReceipt {
+            spirit_nexus_configuration: state.desired_configuration().clone(),
+            meta_configure_done: state.meta_configure_occurred(),
+        })
     }
 
     /// Whether the OFF-by-default mirror shipper is armed (an owner configured
@@ -852,7 +922,7 @@ impl Engine {
     /// advances refuse `Unavailable` until an owner `Configure` re-enables
     /// the gate and recovery resolves the slot. Fail-closed at every fork.
     #[cfg(feature = "criome-gate")]
-    pub async fn stage_working_input(&mut self, input: Input) -> StagedIntake {
+    pub async fn stage_working_input(&mut self, input: Query) -> StagedIntake {
         let authorizer = match self.criome_gate.authorization() {
             crate::criome_gate::CriomeAuthorization::Disabled => {
                 return StagedIntake::Completed(self.handle_async(input).await.into_root());
@@ -865,10 +935,10 @@ impl Engine {
                 "spirit intake refused a head advance (staging unavailable): \
                  {occupied_or_engaged}"
             );
-            return StagedIntake::Completed(Output::advance_refused(
-                signal_schema::AdvanceRefusal::new(
-                    signal_schema::AdvanceRefusalReason::Unavailable,
-                ),
+            return StagedIntake::Completed(Response::AdvanceRefused(
+                signal_schema::AdvanceRefusal {
+                    advance_refusal_reason: signal_schema::AdvanceRefusalReason::Unavailable,
+                },
             ));
         }
         let reply = self.handle_async(input).await.into_root();
@@ -895,10 +965,11 @@ impl Engine {
                     if let Err(abandon_fault) = database.abandon_staged_group() {
                         eprintln!("spirit staging abandon failed: {abandon_fault}");
                     }
-                    StagedIntake::Completed(Output::advance_refused(
-                        signal_schema::AdvanceRefusal::new(
-                            signal_schema::AdvanceRefusalReason::Unreachable,
-                        ),
+                    StagedIntake::Completed(Response::AdvanceRefused(
+                        signal_schema::AdvanceRefusal {
+                            advance_refusal_reason:
+                                signal_schema::AdvanceRefusalReason::Unreachable,
+                        },
                     ))
                 }
             },
@@ -919,7 +990,7 @@ impl Engine {
     pub async fn conclude_staged_advance(
         &mut self,
         advance: crate::criome_gate::StagedHeadAdvance,
-    ) -> Output {
+    ) -> Response {
         let database = self.nexus.store().engine_handle();
         let verdict = advance.verdict().cloned();
         let refusal_reason = match verdict {
@@ -957,7 +1028,9 @@ impl Engine {
                 signal_schema::AdvanceRefusalReason::Unreachable
             }
         };
-        Output::advance_refused(signal_schema::AdvanceRefusal::new(refusal_reason))
+        Response::AdvanceRefused(signal_schema::AdvanceRefusal {
+            advance_refusal_reason: refusal_reason,
+        })
     }
 
     /// §3.8 crash recovery: resolve an occupied durable staging slot by
@@ -988,9 +1061,9 @@ impl Engine {
             parked.prospective_head(),
             // The original caller's connection is gone (§3.5.4); the held
             // reply is unreachable bookkeeping and never delivered.
-            Output::advance_refused(signal_schema::AdvanceRefusal::new(
-                signal_schema::AdvanceRefusalReason::Unreachable,
-            )),
+            Response::AdvanceRefused(signal_schema::AdvanceRefusal {
+                advance_refusal_reason: signal_schema::AdvanceRefusalReason::Unreachable,
+            }),
         );
         advance.resolve().await;
         let digest = parked.prospective_head();
@@ -1005,7 +1078,7 @@ impl Engine {
         }
     }
 
-    pub async fn configure_async(&mut self, request: ConfigureRequest) -> MetaOutput {
+    pub async fn configure_async(&mut self, request: ConfigureRequest) -> MetaResponse {
         let output = self.configure(request);
         #[cfg(feature = "criome-gate")]
         {
@@ -1030,6 +1103,10 @@ impl Engine {
         output
     }
 
+    pub async fn reverse_meta_configuration_async(&mut self) -> MetaResponse {
+        self.reverse_meta_configuration()
+    }
+
     /// Owner-only meta-socket `Import`: write pre-vetted records straight to the
     /// SEMA store with their given identifiers, bypassing the guardian admission
     /// pipeline entirely. This is the privileged restore/migration path — corpus
@@ -1037,30 +1114,30 @@ impl Engine {
     /// stays fully gated; only the owner-only meta socket can import. It aborts
     /// to `Rejected` on the first store error so a partial import is loud, never
     /// silent.
-    pub fn import(&mut self, request: ImportRequest) -> MetaOutput {
+    pub fn import(&mut self, request: ImportRequest) -> MetaResponse {
         let mut record_count: Integer = 0;
-        for imported in request.into_payload().into_payload() {
+        for imported in request.imported_records {
             match self
                 .nexus
                 .store()
-                .import_record(imported.record_identifier.into_payload(), imported.entry)
+                .import_record(imported.record_identifier, imported.entry)
             {
                 Ok(_) => record_count += 1,
                 Err(_) => {
-                    return MetaOutput::rejected(ConfigureRejection {
+                    return MetaResponse::Rejected(ConfigureRejection {
                         configure_rejection_reason: ConfigureRejectionReason::InternalError,
                         database_marker: self.nexus.database_marker(),
                     });
                 }
             }
         }
-        MetaOutput::imported(ImportReceipt {
-            record_count: RecordCount::new(record_count),
+        MetaResponse::Imported(ImportReceipt {
+            record_count,
             database_marker: self.nexus.database_marker(),
         })
     }
 
-    pub async fn import_async(&mut self, request: ImportRequest) -> MetaOutput {
+    pub async fn import_async(&mut self, request: ImportRequest) -> MetaResponse {
         self.import(request)
     }
 
@@ -1077,22 +1154,20 @@ impl Engine {
     /// The hex comes from `EntryDigest`'s own `Display`, so spirit forwards its
     /// real content-addressing, not a re-hash. An empty log honestly reports no
     /// head (`None`).
-    pub fn observe_head(&self) -> MetaOutput {
+    pub fn observe_head(&self) -> MetaResponse {
         match self.nexus.store().versioned_log_head() {
-            Ok(head) => MetaOutput::head_observed(VersionedLogHead {
+            Ok(head) => MetaResponse::HeadObserved(VersionedLogHead {
                 database_marker: self.nexus.database_marker(),
-                selected_head_digest: SelectedHeadDigest::new(
-                    head.map(|digest| HeadDigestHex::new(digest.to_string())),
-                ),
+                selected_head_digest: head.map(|digest| digest.to_string()),
             }),
-            Err(_) => MetaOutput::rejected(ConfigureRejection {
+            Err(_) => MetaResponse::Rejected(ConfigureRejection {
                 configure_rejection_reason: ConfigureRejectionReason::InternalError,
                 database_marker: self.nexus.database_marker(),
             }),
         }
     }
 
-    pub async fn observe_head_async(&self) -> MetaOutput {
+    pub async fn observe_head_async(&self) -> MetaResponse {
         self.observe_head()
     }
 
@@ -1107,27 +1182,25 @@ impl Engine {
     /// sibling `HeadDigestHex` choice navigates. Decoding the hex and
     /// reconstructing through `VersionedCommitLogEntry::new` reproduces the
     /// `ObserveHead` digest, so head and body are consistent by construction.
-    pub fn observe_head_object(&self) -> MetaOutput {
+    pub fn observe_head_object(&self) -> MetaResponse {
         match self.nexus.store().versioned_log_head_object() {
-            Ok(object) => MetaOutput::head_object_observed(VersionedLogHeadObject {
+            Ok(object) => MetaResponse::HeadObjectObserved(VersionedLogHeadObject {
                 database_marker: self.nexus.database_marker(),
-                selected_head_object: SelectedHeadObject::new(object.map(|octets| {
-                    HeadObjectHex::new(
-                        octets
-                            .iter()
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect::<String>(),
-                    )
-                })),
+                selected_head_object: object.map(|octets| {
+                    octets
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                }),
             }),
-            Err(_) => MetaOutput::rejected(ConfigureRejection {
+            Err(_) => MetaResponse::Rejected(ConfigureRejection {
                 configure_rejection_reason: ConfigureRejectionReason::InternalError,
                 database_marker: self.nexus.database_marker(),
             }),
         }
     }
 
-    pub async fn observe_head_object_async(&self) -> MetaOutput {
+    pub async fn observe_head_object_async(&self) -> MetaResponse {
         self.observe_head_object()
     }
 
@@ -1197,18 +1270,18 @@ impl SignalAdmission {
         self.trace_signal_activation(SignalObjectName::Stopped);
     }
 
-    /// Admit a wire Input: mint the origin route, issue a message
+    /// Admit a wire Query: mint the origin route, issue a message
     /// identifier, and validate against the schema-emitted rules.
-    pub fn admit(&self, input: Input) -> Result<SignalAccepted, SignalRejected> {
+    pub fn admit(&self, input: Query) -> Result<SignalAccepted, SignalRejected> {
         let origin_route = self.issue_origin_route();
-        let identifier = self.issue_message_identifier();
-        let short_header = input.short_header();
-        if let Err(validation_error) = input.validate() {
+        if let Some(validation_error) = Self::validation_error(&input) {
             return Err(SignalRejected {
                 origin_route,
                 validation_error,
             });
         }
+        let identifier = self.issue_message_identifier();
+        let short_header = 0;
         #[cfg(feature = "testing-trace")]
         self.trace_signal_admitted();
         Ok(SignalAccepted {
@@ -1218,9 +1291,120 @@ impl SignalAdmission {
         })
     }
 
+    fn entry_validation_error(entry: &signal_schema::Entry) -> Option<ValidationError> {
+        if entry.domains.is_empty() {
+            Some(ValidationError::EmptyDomain)
+        } else if entry.description.trim().is_empty() {
+            Some(ValidationError::EmptyDescription)
+        } else {
+            None
+        }
+    }
+
+    fn justification_validation_error(
+        justification: &signal_schema::Justification,
+    ) -> Option<ValidationError> {
+        if justification.reasoning.trim().is_empty()
+            || justification.testimony.iter().any(|quote| {
+                quote.quote_text.trim().is_empty()
+                    || quote
+                        .optional_antecedent
+                        .as_ref()
+                        .is_some_and(|antecedent| antecedent.trim().is_empty())
+            })
+        {
+            Some(ValidationError::EmptyDescription)
+        } else {
+            None
+        }
+    }
+
+    fn selection_validation_error(selection: &signal_schema::Selection) -> Option<ValidationError> {
+        let empty_scope = matches!(
+            &selection.domain_match,
+            signal_schema::DomainMatch::Partial(scopes) | signal_schema::DomainMatch::Full(scopes)
+                if scopes.is_empty()
+        );
+        if empty_scope {
+            return Some(ValidationError::EmptyQueryDomain);
+        }
+        let bad_keywords = match &selection.keyword_match {
+            signal_schema::KeywordMatch::Any => false,
+            signal_schema::KeywordMatch::AnyKeyword(keywords)
+            | signal_schema::KeywordMatch::AllKeywords(keywords) => {
+                keywords.is_empty() || keywords.iter().any(|keyword| keyword.trim().is_empty())
+            }
+        };
+        if bad_keywords {
+            return Some(ValidationError::EmptyKeyword);
+        }
+        match &selection.text_match {
+            signal_schema::TextMatch::ContainsText(search) if search.trim().is_empty() => {
+                Some(ValidationError::EmptySearchText)
+            }
+            _ => None,
+        }
+    }
+
+    fn validation_error(input: &Query) -> Option<ValidationError> {
+        match input {
+            Query::State(statement) if statement.statement_text.trim().is_empty() => {
+                Some(ValidationError::EmptyDescription)
+            }
+            Query::Record(request) => Self::entry_validation_error(&request.entry)
+                .or_else(|| Self::justification_validation_error(&request.justification)),
+            Query::Propose(proposal) => Self::entry_validation_error(&proposal.entry)
+                .or_else(|| Self::justification_validation_error(&proposal.justification)),
+            Query::ChangeRecord(change) => Self::entry_validation_error(&change.entry)
+                .or_else(|| Self::justification_validation_error(&change.justification)),
+            Query::Clarify(request) if request.description.trim().is_empty() => {
+                Some(ValidationError::EmptyDescription)
+            }
+            Query::Clarify(request) => Self::justification_validation_error(&request.justification),
+            Query::ResolveClarification(resolution) => {
+                if resolution.target_clarifications.is_empty()
+                    || resolution
+                        .target_clarifications
+                        .iter()
+                        .any(|target| target.description.trim().is_empty())
+                {
+                    Some(ValidationError::EmptyDescription)
+                } else {
+                    Self::justification_validation_error(&resolution.justification)
+                }
+            }
+            Query::Supersede(supersession) => {
+                if supersession.retired_identifiers.is_empty()
+                    || supersession.replacements.is_empty()
+                {
+                    Some(ValidationError::EmptyDescription)
+                } else {
+                    supersession
+                        .replacements
+                        .iter()
+                        .find_map(Self::entry_validation_error)
+                        .or_else(|| {
+                            Self::justification_validation_error(&supersession.justification)
+                        })
+                }
+            }
+            Query::Retire(retirement) => {
+                Self::justification_validation_error(&retirement.justification)
+            }
+            Query::Observe(selection)
+            | Query::Count(selection)
+            | Query::SubscribeIntent(selection) => Self::selection_validation_error(selection),
+            Query::Intent(scopes) if scopes.is_empty() => Some(ValidationError::EmptyQueryDomain),
+            Query::TextSearch(search) if search.trim().is_empty() => {
+                Some(ValidationError::EmptySearchText)
+            }
+            _ => None,
+        }
+    }
+
     pub fn triage(
         &self,
-        input: Input,
+        input: Query,
         origin_route: OriginRoute,
     ) -> nexus_schema::nexus::Nexus<NexusWork> {
         #[cfg(not(feature = "testing-trace"))]
@@ -1230,7 +1414,10 @@ impl SignalAdmission {
         NexusWork::signal_arrived(input).with_origin_route(origin_route.into())
     }
 
-    pub fn reply(&self, output: nexus_schema::nexus::Nexus<NexusAction>) -> SignalResponse<Output> {
+    pub fn reply(
+        &self,
+        output: nexus_schema::nexus::Nexus<NexusAction>,
+    ) -> SignalResponse<Response> {
         #[cfg(not(feature = "testing-trace"))]
         let _ = self;
         #[cfg(feature = "testing-trace")]
@@ -1290,9 +1477,9 @@ impl SignalAccepted {
     }
 
     /// Run the validated mail through the SignalEngine + NexusEngine
-    /// composition: triage Signal Input into Nexus Input, execute Nexus
+    /// composition: triage Signal Query into Nexus Query, execute Nexus
     /// (which drives SEMA through `SemaEngine`), and frame the Nexus reply
-    /// as Signal Output.
+    /// as Signal Response.
     ///
     /// The sent hook (the Signal→Nexus on_sent event) fires BEFORE the
     /// triage call, so an observer sees the handoff before any SEMA state
@@ -1304,7 +1491,7 @@ impl SignalAccepted {
         self,
         signal_admission: &SignalAdmission,
         nexus: &mut Nexus,
-    ) -> SignalResponse<Output> {
+    ) -> SignalResponse<Response> {
         #[cfg(not(feature = "testing-trace"))]
         let _ = signal_admission;
         let identifier = self.identifier();
@@ -1383,10 +1570,10 @@ impl MessageSentHook for MailLedgerHook<'_> {
     }
 }
 
-impl MessageProcessedHook<Output> for MailLedgerHook<'_> {
+impl MessageProcessedHook<Response> for MailLedgerHook<'_> {
     type Error = Infallible;
 
-    fn message_processed(&mut self, event: MessageProcessed<Output>) -> Result<(), Self::Error> {
+    fn message_processed(&mut self, event: MessageProcessed<Response>) -> Result<(), Self::Error> {
         let mut state = self.ledger.state.lock().expect("mail ledger lock");
         state.processed_count = state.processed_count.saturating_add(1);
         state.in_flight.remove(&event.identifier().as_integer());
@@ -1395,13 +1582,13 @@ impl MessageProcessedHook<Output> for MailLedgerHook<'_> {
 }
 
 impl nexus_schema::nexus::Nexus<NexusAction> {
-    pub fn into_signal_output(self) -> SignalResponse<Output> {
+    pub fn into_signal_output(self) -> SignalResponse<Response> {
         let origin_route = OriginRoute::from(self.origin_route());
         let root = match self.into_root() {
             NexusAction::ReplyToSignal(output) => output,
-            _ => Output::error(ErrorReport::new(ErrorMessage::new(
-                "nexus returned non-signal action",
-            ))),
+            _ => Response::Error(ErrorReport {
+                error_message: "nexus returned non-signal action".into(),
+            }),
         };
         SignalResponse::new(origin_route, root)
     }
@@ -1456,10 +1643,12 @@ impl std::ops::Deref for nexus_schema::ChangeRecord {
 }
 
 impl SignalRejected {
-    pub fn into_signal_output(self) -> SignalResponse<Output> {
+    pub fn into_signal_output(self) -> SignalResponse<Response> {
         SignalResponse::new(
             self.origin_route,
-            self.validation_error.into_signal_output(),
+            Response::Rejected(signal_schema::SignalRejection {
+                validation_error: self.validation_error,
+            }),
         )
     }
 }

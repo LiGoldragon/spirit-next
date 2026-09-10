@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use crate::schema::signal::{ObservedRecord, RecordSet};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct GuardianRecordBundle {
     seen_identifiers: BTreeSet<String>,
     records: Vec<ObservedRecord>,
@@ -27,19 +27,19 @@ impl GuardianRecordBundle {
     pub(super) fn insert(&mut self, record: ObservedRecord) {
         if self
             .seen_identifiers
-            .insert(record.record_identifier.payload().clone())
+            .insert(record.record_identifier.clone())
         {
             self.records.push(record);
         }
     }
 
     pub(super) fn extend(&mut self, record_set: RecordSet) {
-        for record in record_set.into_payload() {
+        for record in record_set {
             self.insert(record);
         }
     }
 
     pub(super) fn into_record_set(self) -> RecordSet {
-        RecordSet::new(self.records)
+        self.records
     }
 }

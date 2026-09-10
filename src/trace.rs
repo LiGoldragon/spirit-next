@@ -19,14 +19,11 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use signal_introspect::{ComponentTraceEvent, TraceSequence};
+use signal_introspect::{ByteViewable, ComponentTraceEvent, Signalizable};
 use signal_persona::EngineIdentifier;
 
 use crate::TraceEvent;
-pub use triad_runtime::trace::{TraceError, TraceEventFrame, TraceSocketPath};
-
-pub type TraceClient = triad_runtime::trace::TraceClient<ComponentTraceEvent>;
-pub type TraceSocketListener = triad_runtime::trace::TraceSocketListener<ComponentTraceEvent>;
+pub use triad_runtime::trace::{TraceError, TraceEventFrame};
 
 /// The push target for the contract trace events, carried only when the daemon
 /// is configured with a trace socket path.
@@ -34,7 +31,7 @@ pub type TraceSocketListener = triad_runtime::trace::TraceSocketListener<Compone
 struct ComponentTraceSink {
     engine: EngineIdentifier,
     sequence: Arc<AtomicU64>,
-    socket: triad_runtime::trace::TraceLog<ComponentTraceEvent>,
+    socket_path: std::path::PathBuf,
 }
 
 impl ComponentTraceSink {
@@ -42,7 +39,7 @@ impl ComponentTraceSink {
         Self {
             engine,
             sequence: Arc::new(AtomicU64::new(0)),
-            socket: triad_runtime::trace::TraceLog::socket(path),
+            socket_path: path.into(),
         }
     }
 
@@ -50,9 +47,20 @@ impl ComponentTraceSink {
     /// engine identity and the next monotonic per-emitter sequence, then push.
     fn push(&self, event: TraceEvent) {
         let mut projected = ComponentTraceEvent::from(event);
-        projected.engine = self.engine.clone();
-        projected.sequence = TraceSequence::new(self.sequence.fetch_add(1, Ordering::Relaxed));
-        self.socket.record(projected);
+        projected.engine_identifier = self.engine.clone();
+        projected.trace_sequence = self.sequence.fetch_add(1, Ordering::Relaxed) as i64;
+        let Ok(signal) = projected.signalize() else {
+            return;
+        };
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.socket_path) else {
+            return;
+        };
+        let bytes = signal.bytes();
+        let Ok(length) = u32::try_from(bytes.len()) else {
+            return;
+        };
+        let _ = std::io::Write::write_all(&mut stream, &length.to_le_bytes());
+        let _ = std::io::Write::write_all(&mut stream, bytes);
     }
 }
 
@@ -117,19 +125,29 @@ impl TraceEventFrame for TraceEvent {
     }
 }
 
-#[cfg(feature = "nota-text")]
+#[cfg(feature = "datom-cli")]
 impl std::fmt::Display for TraceEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&<Self as nota::NotaEncode>::to_nota(self))
+        use datom_codec::Datomizable;
+        use protos::{Protosizable, Textualizable};
+        formatter.write_str(&self.datomize(vec![]).protosize().textualize())
     }
 }
 
-#[cfg(feature = "nota-text")]
+#[cfg(feature = "datom-cli")]
 impl std::str::FromStr for TraceEvent {
-    type Err = nota::NotaDecodeError;
+    type Err = datom_codec::Error;
 
     fn from_str(source: &str) -> Result<Self, Self::Err> {
-        nota::NotaSource::new(source).parse::<Self>()
+        use datom_codec::{Actualizing, Budget, Potential};
+        use protos::ReaderBudget;
+        let mut pending = Potential::<Self>::from(source.to_owned());
+        pending.actualize(&mut Budget {
+            remaining: 1024,
+            reader: ReaderBudget { remaining: 1024 },
+            depth: 0,
+            maximum_depth: 1024,
+        })
     }
 }
 
@@ -138,15 +156,78 @@ mod tests {
     use signal_introspect::{IntrospectionTarget, TraceLayer};
 
     use super::*;
-    use crate::{ObjectName, SignalObjectName};
+    use crate::{
+        ObjectName, SignalObjectName,
+        schema::nexus::{NexusObjectName, NexusWorkRoute},
+    };
 
     #[test]
     fn projects_signal_admitted_onto_contract_event() {
         let event = TraceEvent::new(ObjectName::Signal(SignalObjectName::Admitted));
         let projected = ComponentTraceEvent::from(event);
 
-        assert_eq!(projected.component, IntrospectionTarget::Signal);
-        assert_eq!(projected.layer, TraceLayer::Signal);
-        assert_eq!(projected.event_name, "SignalAdmitted");
+        assert_eq!(projected.introspection_target, IntrospectionTarget::Signal);
+        assert_eq!(projected.trace_layer, TraceLayer::Signal);
+        assert_eq!(projected.trace_event_name, "SignalAdmitted");
+    }
+
+    #[test]
+    fn socket_trace_events_preserve_engine_identity_and_monotonic_sequence() {
+        use signal_introspect::{Restorable, Signal};
+        use std::{io::Read, os::unix::net::UnixListener, thread};
+
+        let directory = tempfile::tempdir().expect("temporary trace directory");
+        let socket_path = directory.path().join("trace.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind trace listener");
+        let reader = thread::spawn(move || {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept trace event");
+                let mut header = [0_u8; 4];
+                stream.read_exact(&mut header).expect("read frame length");
+                let length = u32::from_le_bytes(header) as usize;
+                let mut bytes = vec![0_u8; length];
+                stream.read_exact(&mut bytes).expect("read trace archive");
+                received.push(
+                    Signal::<ComponentTraceEvent>::from(bytes)
+                        .restore()
+                        .expect("restore fresh trace signal"),
+                );
+            }
+            received
+        });
+
+        let trace = TraceLog::socket("engine-under-test".to_owned(), &socket_path);
+        trace.record(TraceEvent::new(ObjectName::Signal(
+            SignalObjectName::Admitted,
+        )));
+        trace.record(TraceEvent::new(ObjectName::Signal(
+            SignalObjectName::Replied,
+        )));
+        let events = reader.join().expect("trace reader joins");
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.engine_identifier.is_empty())
+        );
+        assert_eq!(events[0].engine_identifier, "engine-under-test");
+        assert_eq!(events[0].trace_sequence, 0);
+        assert_eq!(events[1].trace_sequence, 1);
+        assert!(events[0].trace_sequence < events[1].trace_sequence);
+    }
+
+    #[test]
+    fn nested_trace_route_round_trips_through_datom() {
+        let event = TraceEvent::new(ObjectName::Nexus(NexusObjectName::Work(
+            NexusWorkRoute::SignalArrived,
+        )));
+        let text = event.to_string();
+        assert_eq!(text.parse::<TraceEvent>().expect("restore trace"), event);
+    }
+
+    #[test]
+    fn malformed_trace_text_is_rejected() {
+        assert!("Nexus.Work.Unknown".parse::<TraceEvent>().is_err());
     }
 }

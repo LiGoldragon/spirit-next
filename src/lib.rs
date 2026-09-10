@@ -4,9 +4,8 @@
 //! types come from the generated `signal-spirit` contract, and owner-only meta
 //! types come from the generated `meta-signal-spirit` contract. The daemon-local
 //! Nexus, SEMA, and daemon modules are checked-in generated source through
-//! `schema` and `schema-rust`. The hand-written code here is the
-//! runtime shim around those generated interfaces. `build.rs` verifies the
-//! generated modules are fresh.
+//! generated Ethos signal contracts. The local component interactions are
+//! authored Rust and are compiled directly.
 //!
 //! Plane envelopes make cross-plane mis-wiring a type error. A SEMA store
 //! accepts only `sema::Sema<sema::WriteInput>` for durable writes and
@@ -26,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod component_daemon;
 pub mod config;
 #[cfg(feature = "criome-gate")]
 pub mod criome_gate;
@@ -54,28 +54,31 @@ pub mod transport;
 pub mod schema {
     #[rustfmt::skip]
     pub mod domain {
-        pub use signal_spirit::schema::domain::*;
+        pub use signal_domain::*;
     }
     #[rustfmt::skip]
     pub mod signal {
-        pub use signal_spirit::schema::signal::*;
+        pub use signal_spirit::*;
     }
     #[rustfmt::skip]
+    #[path = "../component_nexus.rs"]
     pub mod nexus;
     #[rustfmt::skip]
+    #[path = "../component_sema.rs"]
     pub mod sema;
     #[rustfmt::skip]
     pub mod meta_signal {
-        pub use meta_signal_spirit::schema::meta_signal::*;
+        pub use meta_signal_spirit::*;
     }
     #[rustfmt::skip]
     pub mod meta_signal_contract {
         pub use meta_signal_spirit::*;
     }
-    #[rustfmt::skip]
-    pub mod daemon;
 }
 
+pub use component_daemon::{
+    ComponentDaemon, DaemonCommand, DaemonEntry, DaemonError, ListenerTier,
+};
 pub use config::{Configuration, ConfigurationError};
 #[cfg(feature = "criome-gate")]
 pub use criome_gate::{
@@ -98,20 +101,17 @@ pub use guardian::{
     AgentGuardian, AgentGuardianConfiguration, AgentGuardianError, AgentGuardianRejection,
     AgentJudge, AgentJudgeConfiguration, AgentJudgeDecision, AgentJudgeError, AgentJudgeRejection,
 };
-pub use meta_transport::{
-    MetaFrameError, MetaInputRoute, MetaOutputRoute, MetaSignalTransport, MetaTransportError,
-};
+pub use meta_transport::{MetaSignalTransport, MetaTransportError};
 pub use nexus::{Nexus, StashTable};
 #[cfg(feature = "production-migration")]
 pub use production_migration::{
     StoreMigration, StoreMigrationCompleted, StoreMigrationError, StoreMigrationOutput,
     StoreMigrationRequest,
 };
-pub use schema::daemon::{ComponentDaemon, DaemonCommand, DaemonEntry, DaemonError, ListenerTier};
 #[cfg(feature = "mirror-shipper")]
 pub use shipper::{MirrorShipper, MirrorShipperError};
 pub use store::{SPIRIT_STORE_NAME, Store, StoreError, StoreFamilyDirectory};
 #[cfg(feature = "testing-trace")]
-pub use trace::{TraceClient, TraceError, TraceLog, TraceSocketListener, TraceSocketPath};
+pub use trace::{TraceError, TraceLog};
 pub use trace_event::{AuthorizationObjectName, ObjectName, TraceEvent};
 pub use transport::{SignalTransport, TransportError};

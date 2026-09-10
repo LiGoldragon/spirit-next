@@ -9,7 +9,9 @@
 
 use sema_engine::{FamilyDirectory, RecordKey, RowMaterializer, SchemaHash, TableReference};
 
-use crate::schema::sema::{Migration, RecordFamily, StoredRecord, family_identity};
+use crate::schema::sema::{
+    Migration, RecordFamily, StoredNexusConfiguration, StoredRecord, family_identity,
+};
 
 /// The component's typed knowledge of where each schema-declared record
 /// family materializes: the fold/import surface hands this directory one
@@ -19,6 +21,7 @@ use crate::schema::sema::{Migration, RecordFamily, StoredRecord, family_identity
 pub struct StoreFamilyDirectory {
     pub(super) entries: TableReference<StoredRecord>,
     pub(super) migrations: TableReference<Migration>,
+    pub(super) configurations: TableReference<StoredNexusConfiguration>,
 }
 
 impl StoreFamilyDirectory {
@@ -28,6 +31,9 @@ impl StoreFamilyDirectory {
         Self {
             entries: TableReference::new(*RecordFamily::records_family().name()),
             migrations: TableReference::new(*RecordFamily::migrations_family().name()),
+            configurations: TableReference::new(
+                *RecordFamily::nexus_configurations_family().name(),
+            ),
         }
     }
 }
@@ -39,6 +45,8 @@ impl FamilyDirectory for StoreFamilyDirectory {
             row.apply(self.entries)
         } else if schema_hash == SchemaHash::new(family_identity::MIGRATIONS_FAMILY) {
             row.apply(self.migrations)
+        } else if schema_hash == SchemaHash::new(family_identity::NEXUS_CONFIGURATIONS_FAMILY) {
+            row.apply(self.configurations)
         } else {
             Err(sema_engine::Error::FamilyUnknown {
                 family: row.family().family().as_str().to_owned(),

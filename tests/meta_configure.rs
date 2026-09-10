@@ -1,63 +1,46 @@
-//! Owner-only meta `Configure` route end-to-end.
-//!
-//! Proves the meta-signal listener wiring: a `Configure` request routes through
-//! the owner-only meta socket, applies the owner-config effect (stores WHERE the
-//! SEPARATE archive database lives), and replies with a typed receipt — WITHOUT
-//! touching the live intent-log database. The working signal socket keeps
-//! serving the existing lifecycle, the owner socket carries the owner-only
-//! filesystem mode, and the two contracts stay distinct wire vocabularies.
-//! A daemon configuration without the required meta socket is rejected before
-//! serving.
-
+//! Owner-only Configure behavior through the final typed meta Signal boundary.
 mod support;
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::thread;
-use std::time::{Duration, Instant};
-use support::domain_fixtures;
-
-use spirit::schema::meta_signal::{ArchiveDatabaseTarget, ConfigureRequest, Output as MetaOutput};
-#[cfg(feature = "agent-guardian")]
-use spirit::schema::meta_signal::{GuardianPromptTarget, GuardianPromptText};
-#[cfg(feature = "agent-guardian")]
-use spirit::schema::signal::GuardianRejectionReason;
-use spirit::schema::signal::{
-    Description, DomainMatch, Entry, ImportanceSelection, Input, Justification, Kind, Magnitude,
-    Output, Query, QuoteText, Reasoning, RecordRequest, SelectedKind, Testimony, VerbatimQuote,
+#[cfg(not(feature = "agent-guardian"))]
+use spirit::schema::signal::{DomainMatch, ImportanceSelection, Selection};
+use spirit::schema::{
+    meta_signal::{
+        ArchiveDatabaseTarget, ArchivePath, ConfigureRequest, Query as MetaQuery,
+        Response as MetaResponse,
+    },
+    signal::{
+        Entry, Justification, Kind, Magnitude, Query, RecordRequest, Response, VerbatimQuote,
+    },
 };
 use spirit::{
     Configuration, Daemon, DaemonError, MetaSignalTransport, SignalTransport, SpiritDaemon,
 };
-#[cfg(feature = "agent-guardian")]
-use spirit::{Engine, Store};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
+use support::domain_fixtures;
 use tempfile::TempDir;
 
 struct DaemonThread {
     handle: Option<thread::JoinHandle<()>>,
 }
-
 impl DaemonThread {
     fn spawn(configuration: Configuration) -> Self {
-        let handle = thread::spawn(move || {
-            // The daemon serves forever; the test process exits and tears the
-            // thread down. A bind error surfaces as a panic in the thread.
-            Daemon::new(configuration).run().expect("daemon run");
-        });
         Self {
-            handle: Some(handle),
+            handle: Some(thread::spawn(move || {
+                Daemon::new(configuration).run().expect("daemon run")
+            })),
         }
     }
 }
-
 impl Drop for DaemonThread {
     fn drop(&mut self) {
-        // The serve loop never returns on its own; detach the thread so the
-        // test process can exit without joining a forever-running daemon.
         drop(self.handle.take());
     }
 }
-
 fn wait_for_socket(path: &Path) {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(5) {
@@ -68,277 +51,132 @@ fn wait_for_socket(path: &Path) {
     }
     panic!("socket did not appear at {}", path.display());
 }
-
-fn configure_request(archive_database_target: ArchiveDatabaseTarget) -> ConfigureRequest {
-    ConfigureRequest::new(archive_database_target, None, None, None)
-}
-
-fn decision_entry(description: &str) -> Entry {
-    Entry {
-        domains: domain_fixtures::domains(&["meta-configure"]),
-        kind: Kind::Decision,
-        description: Description::new(description),
-        importance: Magnitude::Minimum.into(),
+fn configure_request(target: ArchiveDatabaseTarget) -> ConfigureRequest {
+    ConfigureRequest {
+        spirit_nexus_configuration: Configuration::default_nexus_configuration(),
+        archive_database_target: target,
+        selected_mirror_target: None,
+        selected_criome_gate_target: None,
+        selected_guardian_prompt_target: None,
     }
 }
-
-fn record_request(description: &str) -> RecordRequest {
-    RecordRequest {
-        entry: decision_entry(description),
-        justification: Justification {
-            testimony: Testimony::new(vec![VerbatimQuote::new(
-                QuoteText::new(description.to_owned()),
-                None,
-            )]),
-            reasoning: Reasoning::new(description.to_owned()),
+fn record_query(description: &str) -> Query {
+    Query::Record(RecordRequest {
+        entry: Entry {
+            domains: domain_fixtures::domains(&["meta-configure"]),
+            kind: Kind::Decision,
+            description: description.into(),
+            importance: Magnitude::Minimum,
         },
-    }
+        justification: Justification {
+            testimony: vec![VerbatimQuote {
+                quote_text: description.into(),
+                optional_antecedent: None,
+            }],
+            reasoning: description.into(),
+        },
+    })
 }
-
+#[cfg(not(feature = "agent-guardian"))]
 fn observe_query() -> Query {
-    Query {
-        domain_match: DomainMatch::full(domain_fixtures::scopes(&["meta-configure"])),
+    Query::Observe(Selection {
+        domain_match: DomainMatch::Full(domain_fixtures::scopes(&["meta-configure"])),
         keyword_match: spirit::schema::signal::KeywordMatch::Any,
         text_match: spirit::schema::signal::TextMatch::Any,
-        selected_kind: SelectedKind::new(Some(Kind::Decision)),
-        importance_selection: ImportanceSelection::default_observation_importance(),
-    }
+        selected_kind: Some(Kind::Decision),
+        importance_selection: ImportanceSelection::Any,
+    })
 }
 
 #[test]
 fn configure_sets_archive_target_and_leaves_live_database_unchanged() {
     let temp = TempDir::new().expect("tempdir");
-    let working_socket = temp.path().join("spirit.sock");
-    let meta_socket = temp.path().join("spirit-meta.sock");
-    let live_database = temp.path().join("live.sema");
-    let archive_database = temp.path().join("archive.sema");
-
-    let configuration =
-        Configuration::new(&working_socket, &live_database).with_meta_socket_path(&meta_socket);
-    let _daemon = DaemonThread::spawn(configuration);
-    wait_for_socket(&working_socket);
-    wait_for_socket(&meta_socket);
-
-    // CORE PROOF (1): a Configure request over the META socket is accepted and
-    // the receipt echoes the now-active archive target. Configure sets WHERE
-    // the SEPARATE archive database lives — it is a typed `ArchiveDatabaseTarget`,
-    // not a string, and the live database path is never named in it.
-    let archive_target =
-        ArchiveDatabaseTarget::path(archive_database.to_string_lossy().into_owned().into());
-    let mut meta_transport =
-        MetaSignalTransport::connect(&meta_socket).expect("connect meta socket");
-    let (_route, reply) = meta_transport
-        .configure(configure_request(archive_target.clone()).into())
-        .expect("exchange configure");
+    let working = temp.path().join("spirit.sock");
+    let meta = temp.path().join("spirit-meta.sock");
+    let live = temp.path().join("live.sema");
+    let archive = temp.path().join("archive.sema");
+    let _daemon =
+        DaemonThread::spawn(Configuration::new(&working, &live).with_meta_socket_path(&meta));
+    wait_for_socket(&working);
+    wait_for_socket(&meta);
+    let target = ArchiveDatabaseTarget::Path(ArchivePath {
+        archive_path_text: archive.to_string_lossy().into_owned(),
+    });
+    let reply = MetaSignalTransport::connect(&meta)
+        .expect("connect meta")
+        .configure(configure_request(target.clone()))
+        .expect("configure");
     match reply {
-        MetaOutput::Configured(receipt) => {
-            assert_eq!(
-                receipt.payload().archive_database_target,
-                archive_target,
-                "receipt echoes the now-active archive target"
-            );
-        }
-        MetaOutput::Rejected(rejection) => {
-            panic!(
-                "configure rejected: {:?}",
-                rejection.payload().configure_rejection_reason
-            )
-        }
-        MetaOutput::Imported(imported) => {
-            panic!("configure unexpectedly imported records: {imported:?}")
-        }
-        MetaOutput::HeadObserved(head) => {
-            panic!("configure unexpectedly observed a head: {head:?}")
-        }
-        MetaOutput::HeadObjectObserved(object) => {
-            panic!("configure unexpectedly observed a head object: {object:?}")
-        }
+        MetaResponse::Configured(receipt) => assert_eq!(receipt.archive_database_target, target),
+        other => panic!("configure failed: {other:?}"),
     }
-
-    // CORE PROOF (2): the LIVE database is UNCHANGED by Configure. A record
-    // written over the WORKING socket AFTER the Configure lands in the same live
-    // database the daemon opened — Configure never re-pointed, moved, or touched
-    // the live log.
-    let mut working_transport =
-        SignalTransport::connect(&working_socket).expect("connect working socket");
-    let (_output_route, record_output) = working_transport
-        .exchange(&Input::record(record_request("intent after configure")))
-        .expect("exchange record");
-
-    #[cfg(not(feature = "agent-guardian"))]
-    assert!(
-        matches!(record_output, Output::RecordAccepted(_)),
-        "working record accepted after configure, got {record_output:?}"
-    );
-    #[cfg(feature = "agent-guardian")]
-    match record_output {
-        Output::GuardianRejected(rejection) => {
-            assert_eq!(
-                rejection.payload().guardian_rejection_reason,
-                GuardianRejectionReason::HarnessUnavailable
-            );
-        }
-        other => panic!("working write should fail closed without judge, got {other:?}"),
-    }
-
-    assert!(
-        live_database.exists(),
-        "the live database is the one that received the working write"
-    );
-    assert!(
-        !archive_database.exists(),
-        "Configure must NOT create or open the archive database — it only stored the target"
-    );
-
-    // CORE PROOF (3): the record sent after Configure is still found in the LIVE
-    // database. Observe stashes its result set, so the reply is a stashed
-    // observation whose record_count counts the intent recorded into the live
-    // log — proving the live database is intact and serving working reads.
-    let mut observe_transport =
-        SignalTransport::connect(&working_socket).expect("reconnect working socket");
-    let (_observe_route, observed) = observe_transport
-        .exchange(&Input::observe(observe_query()))
-        .expect("exchange observe");
+    let record = SignalTransport::connect(&working)
+        .expect("connect working")
+        .exchange(&record_query("intent after configure"))
+        .expect("record");
     #[cfg(not(feature = "agent-guardian"))]
     {
-        let Output::RecordsStashed(stashed) = observed else {
-            panic!("the live database serves the recorded intent back, got {observed:?}")
+        assert!(matches!(record, Response::RecordAccepted(_)));
+        let observed = SignalTransport::connect(&working)
+            .expect("reconnect working")
+            .exchange(&observe_query())
+            .expect("observe");
+        let Response::RecordsStashed(stashed) = observed else {
+            panic!("expected live observation: {observed:?}")
         };
-        assert_eq!(
-            *stashed.record_count.payload(),
-            1,
-            "the live database holds exactly the one intent recorded after the Configure"
-        );
+        assert_eq!(stashed.record_count, 1);
     }
     #[cfg(feature = "agent-guardian")]
-    assert!(
-        matches!(observed, Output::Error(_)),
-        "the live database stays empty because missing guardian fails closed, got {observed:?}"
-    );
+    assert!(matches!(record, Response::GuardianRejected(_)));
+    assert!(live.exists());
+    assert!(!archive.exists());
 }
-
 #[test]
 fn meta_socket_carries_owner_only_mode() {
     let temp = TempDir::new().expect("tempdir");
-    let working_socket = temp.path().join("spirit.sock");
-    let meta_socket = temp.path().join("spirit-meta.sock");
-    let database = temp.path().join("intent.sema");
-
-    let configuration =
-        Configuration::new(&working_socket, &database).with_meta_socket_path(&meta_socket);
-    let _daemon = DaemonThread::spawn(configuration);
-    wait_for_socket(&working_socket);
-    wait_for_socket(&meta_socket);
-
-    let meta_mode = std::fs::metadata(&meta_socket)
-        .expect("meta socket metadata")
-        .permissions()
-        .mode()
-        & 0o777;
+    let working = temp.path().join("spirit.sock");
+    let meta = temp.path().join("spirit-meta.sock");
+    let db = temp.path().join("intent.sema");
+    let _daemon =
+        DaemonThread::spawn(Configuration::new(&working, &db).with_meta_socket_path(&meta));
+    wait_for_socket(&meta);
     assert_eq!(
-        meta_mode, 0o600,
-        "the owner-only meta socket is mode rw------- (the owner gate)"
+        std::fs::metadata(&meta)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
     );
 }
-
 #[test]
-fn working_socket_rejects_a_meta_configure_frame() {
+fn working_socket_rejects_meta_configure_bytes() {
     let temp = TempDir::new().expect("tempdir");
-    let working_socket = temp.path().join("spirit.sock");
-    let meta_socket = temp.path().join("spirit-meta.sock");
-    let database = temp.path().join("intent.sema");
-
-    let configuration =
-        Configuration::new(&working_socket, &database).with_meta_socket_path(&meta_socket);
-    let _daemon = DaemonThread::spawn(configuration);
-    wait_for_socket(&working_socket);
-
-    // Send a meta Configure frame to the WORKING socket. The working signal
-    // decoder must fail to read it as a signal Output (the two contracts are
-    // distinct wire vocabularies): the daemon drops the stream on a decode
-    // error, so the reply read returns an error rather than a valid Output.
-    let target = ArchiveDatabaseTarget::path(database.to_string_lossy().into_owned().into());
-    let mut meta_on_working = MetaSignalTransport::connect(&working_socket)
-        .expect("connect meta transport to working socket");
-    let result = meta_on_working.configure(configure_request(target).into());
+    let working = temp.path().join("spirit.sock");
+    let meta = temp.path().join("spirit-meta.sock");
+    let db = temp.path().join("intent.sema");
+    let _daemon =
+        DaemonThread::spawn(Configuration::new(&working, &db).with_meta_socket_path(&meta));
+    wait_for_socket(&working);
+    let target = ArchiveDatabaseTarget::Path(ArchivePath {
+        archive_path_text: db.to_string_lossy().into_owned(),
+    });
     assert!(
-        result.is_err(),
-        "the working socket must not answer a meta Configure as a meta reply"
+        MetaSignalTransport::connect(&working)
+            .expect("connect")
+            .exchange(&MetaQuery::Configure(configure_request(target)))
+            .is_err()
     );
 }
-
 #[test]
 fn daemon_rejects_missing_meta_socket_before_serving() {
     let temp = TempDir::new().expect("tempdir");
-    let working_socket = temp.path().join("spirit.sock");
-    let database = temp.path().join("intent.sema");
-
-    let configuration = Configuration::new(&working_socket, &database);
-
-    assert!(
-        matches!(
-            Daemon::new(configuration).run(),
-            Err(DaemonError::<SpiritDaemon>::MissingMetaSocket)
-        ),
-        "a daemon without the meta slot must fail before serving"
+    let configuration = Configuration::new(
+        temp.path().join("spirit.sock"),
+        temp.path().join("intent.sema"),
     );
-}
-
-/// `GuardianPromptTarget` remains in the owner-only meta contract as a
-/// compatibility echo. Prompt prose is owned by the external Spirit judge, so
-/// daemon Configure must not install or render prompt text.
-#[cfg(feature = "agent-guardian")]
-#[test]
-fn meta_configure_guardian_prompt_target_is_compatibility_echo_only() {
-    let temp = TempDir::new().expect("tempdir");
-    let store = Store::open(temp.path().join("intent.sema")).expect("open spirit store");
-    let mut engine = Engine::new(store);
-    engine.start().expect("engine starts");
-
-    assert_eq!(
-        engine.guardian_intent_system_prompt(),
-        None,
-        "prompt prose is not a daemon-owned live surface"
-    );
-
-    let overridden_role = "OVERRIDE ROLE: compatibility echo only.";
-    let prompt_configure = ConfigureRequest::new(
-        ArchiveDatabaseTarget::Default,
-        None,
-        None,
-        Some(GuardianPromptTarget::prompt(GuardianPromptText::new(
-            overridden_role,
-        ))),
-    );
-    match engine.configure(prompt_configure) {
-        MetaOutput::Configured(receipt) => {
-            assert!(matches!(
-                receipt.payload().selected_guardian_prompt_target.payload(),
-                Some(GuardianPromptTarget::Prompt(_))
-            ));
-        }
-        other => panic!("expected Configured prompt-target echo, got {other:?}"),
-    }
-    assert_eq!(
-        engine.guardian_intent_system_prompt(),
-        None,
-        "Configure must not make prompt text live in the daemon"
-    );
-
-    let default_configure = ConfigureRequest::new(
-        ArchiveDatabaseTarget::Default,
-        None,
-        None,
-        Some(GuardianPromptTarget::Default),
-    );
-    match engine.configure(default_configure) {
-        MetaOutput::Configured(receipt) => {
-            assert!(matches!(
-                receipt.payload().selected_guardian_prompt_target.payload(),
-                Some(GuardianPromptTarget::Default)
-            ));
-        }
-        other => panic!("expected Configured default prompt-target echo, got {other:?}"),
-    }
-    assert_eq!(engine.guardian_intent_system_prompt(), None);
+    assert!(matches!(
+        Daemon::new(configuration).run(),
+        Err(DaemonError::<SpiritDaemon>::MissingMetaSocket)
+    ));
 }

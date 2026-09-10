@@ -3,7 +3,7 @@
 //! With criome authorization Enabled, a head-advancing working operation is
 //! STAGED — built and durably parked without committing — and accepted ONLY
 //! on the cluster grant; every other terminal verdict refuses the operation
-//! to the caller (`Output::AdvanceRefused`) and discards the staged group,
+//! to the caller (`Response::AdvanceRefused`) and discards the staged group,
 //! so nothing is recorded anywhere: the head does not advance, not even
 //! locally. Reads are unaffected.
 //!
@@ -28,11 +28,11 @@ use signal_criome::{
     AuthorizationStatus, CriomeReply, CriomeRequest, Identity, ObjectDigest,
     SignatureAuthorizationResult, TimestampNanos,
 };
-use spirit::schema::daemon::{ComponentDaemon, WorkingInputLane};
+use spirit::ComponentDaemon;
+use spirit::component_daemon::WorkingQueryLane;
 use spirit::schema::signal::{
-    AdvanceRefusalReason, Description, Entry, Importance, ImportanceBump, Input, Justification,
-    Kind, Magnitude, Output, QuoteText, Reasoning, RecordIdentifier, RecordRequest, SearchText,
-    Statement, StatementText, Testimony, VerbatimQuote,
+    AdvanceRefusalReason, Entry, ImportanceBump, Justification, Kind, Magnitude, Query,
+    RecordRequest, Response, Statement, VerbatimQuote,
 };
 use spirit::{
     ClusterAuthorizer, CriomeAuthorization, Engine, SPIRIT_STORE_NAME, SpiritDaemon, StagedIntake,
@@ -54,12 +54,15 @@ fn record_request(description: &str) -> RecordRequest {
         entry: Entry {
             domains: domain_fixtures::domains(&["Information/Documentation"]),
             kind: Kind::Decision,
-            description: Description::new(description),
-            importance: Importance::new(Magnitude::Medium),
+            description: description.into(),
+            importance: Magnitude::Medium,
         },
         justification: Justification {
-            testimony: Testimony::new(vec![VerbatimQuote::new(QuoteText::new(description), None)]),
-            reasoning: Reasoning::new(description),
+            testimony: vec![VerbatimQuote {
+                quote_text: description.into(),
+                optional_antecedent: None,
+            }],
+            reasoning: description.into(),
         },
     }
 }
@@ -93,35 +96,39 @@ impl ObservableState {
 
 /// THE CLOSED INTAKE CLASSIFICATION (§3.5.5): representatives of both lanes.
 /// The exhaustive match itself lives in `SpiritDaemon::working_input_lane`,
-/// so a new `Input` variant fails the COMPILE until it chooses a lane; this
+/// so a new `Query` variant fails the COMPILE until it chooses a lane; this
 /// witness pins the semantic of each class.
 #[test]
 fn head_advancing_inputs_stage_and_reads_stay_immediate() {
-    let advancing: Vec<Input> = vec![
-        Input::record(record_request("a lane witness record")),
-        Input::state(Statement::new(StatementText::new("a raw statement"))),
-        Input::bump_importance(ImportanceBump::new(RecordIdentifier::new("record-1"))),
-        Input::retire(spirit::schema::signal::Retirement {
-            record_identifier: RecordIdentifier::new("record-1"),
+    let advancing: Vec<Query> = vec![
+        Query::Record(record_request("a lane witness record")),
+        Query::State(Statement {
+            statement_text: "a raw statement".into(),
+        }),
+        Query::BumpImportance(ImportanceBump {
+            record_identifier: "record-1".into(),
+        }),
+        Query::Retire(spirit::schema::signal::Retirement {
+            record_identifier: "record-1".into(),
             justification: record_request("justify").justification,
         }),
     ];
     for input in &advancing {
         assert_eq!(
             SpiritDaemon::working_input_lane(input),
-            WorkingInputLane::Staged,
+            WorkingQueryLane::Staged,
             "a head-advancing input takes the staged lane: {input:?}"
         );
     }
-    let immediate: Vec<Input> = vec![
-        Input::Version,
-        Input::Marker,
-        Input::text_search(SearchText::new("anything")),
+    let immediate: Vec<Query> = vec![
+        Query::Version,
+        Query::Marker,
+        Query::TextSearch("anything".into()),
     ];
     for input in &immediate {
         assert_eq!(
             SpiritDaemon::working_input_lane(input),
-            WorkingInputLane::Immediate,
+            WorkingQueryLane::Immediate,
             "a read passes ungated on the immediate lane: {input:?}"
         );
     }
@@ -138,24 +145,24 @@ fn reads_flow_ungated_while_the_gate_is_enabled_and_criome_is_absent() {
         let mut engine = open_engine(directory.path().join("reads.sema"));
         // Seed one record while Disabled so the observation read has content.
         let seeded = engine
-            .handle_async(Input::record(record_request("a seeded record to observe")))
+            .handle_async(Query::Record(record_request("a seeded record to observe")))
             .await
             .into_root();
-        assert!(matches!(seeded, Output::RecordAccepted(_)));
+        assert!(matches!(seeded, Response::RecordAccepted(_)));
         engine.set_criome_authorization(CriomeAuthorization::Enabled(ClusterAuthorizer::new(
             directory.path().join("no-criome.sock"),
         )));
-        let version = engine.handle_async(Input::Version).await.into_root();
+        let version = engine.handle_async(Query::Version).await.into_root();
         assert!(
-            matches!(version, Output::VersionReported(_)),
+            matches!(version, Response::VersionReported(_)),
             "reads stay served under an enabled gate, got {version:?}"
         );
         let search = engine
-            .handle_async(Input::text_search(SearchText::new("seeded")))
+            .handle_async(Query::TextSearch("seeded".into()))
             .await
             .into_root();
         assert!(
-            matches!(search, Output::RecordsObserved(_)),
+            matches!(search, Response::RecordsObserved(_)),
             "observation reads stay served under an enabled gate, got {search:?}"
         );
     });
@@ -179,7 +186,7 @@ fn a_refused_advance_is_refused_to_the_caller_and_leaves_no_trace() {
         let before = ObservableState::capture(&engine);
 
         let staged = engine
-            .stage_working_input(Input::record(record_request("a refused operation")))
+            .stage_working_input(Query::Record(record_request("a refused operation")))
             .await;
         let StagedIntake::Parked(mut advance) = staged else {
             panic!("a head advance under an enabled gate parks, got {staged:?}");
@@ -187,9 +194,9 @@ fn a_refused_advance_is_refused_to_the_caller_and_leaves_no_trace() {
         advance.resolve().await;
         let reply = engine.conclude_staged_advance(advance).await;
         match reply {
-            Output::AdvanceRefused(refused) => assert_eq!(
-                refused.payload().payload(),
-                &AdvanceRefusalReason::Unreachable,
+            Response::AdvanceRefused(refused) => assert_eq!(
+                refused.advance_refusal_reason,
+                AdvanceRefusalReason::Unreachable,
                 "an absent criome refuses the operation as Unreachable"
             ),
             other => panic!("the operation is refused to the caller, got {other:?}"),
@@ -319,15 +326,15 @@ fn a_granted_advance_materializes_exactly_the_staged_group() {
         // The Disabled twin: today's direct write, for content equality.
         let mut twin = open_engine(directory.path().join("twin.sema"));
         let twin_reply = twin
-            .handle_async(Input::record(record_request("the granted operation")))
+            .handle_async(Query::Record(record_request("the granted operation")))
             .await
             .into_root();
-        let Output::RecordAccepted(twin_accepted) = &twin_reply else {
+        let Response::RecordAccepted(twin_accepted) = &twin_reply else {
             panic!("the twin accepts directly, got {twin_reply:?}");
         };
         let twin_entry = twin
             .store()
-            .entry_by_identifier(twin_accepted.payload().payload())
+            .entry_by_identifier(twin_accepted)
             .expect("twin lookup")
             .expect("the twin record exists");
 
@@ -338,12 +345,12 @@ fn a_granted_advance_materializes_exactly_the_staged_group() {
         engine.set_criome_authorization(CriomeAuthorization::Enabled(stub.authorizer()));
 
         let staged = engine
-            .stage_working_input(Input::record(record_request("the granted operation")))
+            .stage_working_input(Query::Record(record_request("the granted operation")))
             .await;
         let StagedIntake::Parked(mut advance) = staged else {
             panic!("the advance parks awaiting the round, got {staged:?}");
         };
-        let parked_digest = advance.prospective_head().clone();
+        let parked_digest = *advance.prospective_head();
         assert_eq!(
             engine.versioned_log_head().expect("head reads"),
             None,
@@ -351,7 +358,7 @@ fn a_granted_advance_materializes_exactly_the_staged_group() {
         );
         advance.resolve().await;
         let reply = engine.conclude_staged_advance(advance).await;
-        let Output::RecordAccepted(gated_accepted) = &reply else {
+        let Response::RecordAccepted(gated_accepted) = &reply else {
             panic!("the grant releases the held accepted reply, got {reply:?}");
         };
         let gated_head = engine
@@ -367,7 +374,7 @@ fn a_granted_advance_materializes_exactly_the_staged_group() {
         // record either way.
         let gated_entry = engine
             .store()
-            .entry_by_identifier(gated_accepted.payload().payload())
+            .entry_by_identifier(gated_accepted)
             .expect("gated lookup")
             .expect("the held reply's identifier resolves after materialization");
         assert_eq!(
@@ -404,7 +411,7 @@ fn each_terminal_refusal_reason_surfaces_to_the_caller() {
             engine.set_criome_authorization(CriomeAuthorization::Enabled(stub.authorizer()));
             let before = ObservableState::capture(&engine);
             let staged = engine
-                .stage_working_input(Input::record(record_request("a refused reason probe")))
+                .stage_working_input(Query::Record(record_request("a refused reason probe")))
                 .await;
             let StagedIntake::Parked(mut advance) = staged else {
                 panic!("the advance parks, got {staged:?}");
@@ -412,9 +419,8 @@ fn each_terminal_refusal_reason_surfaces_to_the_caller() {
             advance.resolve().await;
             let reply = engine.conclude_staged_advance(advance).await;
             match reply {
-                Output::AdvanceRefused(refused) => assert_eq!(
-                    refused.payload().payload(),
-                    &reason,
+                Response::AdvanceRefused(refused) => assert_eq!(
+                    refused.advance_refusal_reason, reason,
                     "the terminal verdict surfaces its own closed reason"
                 ),
                 other => panic!("the operation is refused to the caller, got {other:?}"),
@@ -444,14 +450,14 @@ fn crash_recovery_materializes_a_parked_group_on_the_recovery_grant() {
         let mut engine = open_engine(store_path.clone());
         engine.set_criome_authorization(CriomeAuthorization::Enabled(stub.authorizer()));
         let staged = engine
-            .stage_working_input(Input::record(record_request("the crash-window operation")))
+            .stage_working_input(Query::Record(record_request("the crash-window operation")))
             .await;
         let StagedIntake::Parked(advance) = staged else {
             panic!("the advance parks, got {staged:?}");
         };
         // CRASH between park and conclude: the advance is dropped without a
         // verdict, the engine is dropped, the durable slot survives.
-        advance.prospective_head().clone()
+        *advance.prospective_head()
     });
 
     runtime.block_on(async {
@@ -473,12 +479,12 @@ fn crash_recovery_materializes_a_parked_group_on_the_recovery_grant() {
         let stub = StubCriome::spawn(StubVerdict::Granted, 1);
         engine.set_criome_authorization(CriomeAuthorization::Enabled(stub.authorizer()));
         let refused = engine
-            .stage_working_input(Input::record(record_request("too early")))
+            .stage_working_input(Query::Record(record_request("too early")))
             .await;
         match refused {
-            StagedIntake::Completed(Output::AdvanceRefused(refused)) => assert_eq!(
-                refused.payload().payload(),
-                &AdvanceRefusalReason::Unavailable,
+            StagedIntake::Completed(Response::AdvanceRefused(refused)) => assert_eq!(
+                refused.advance_refusal_reason,
+                AdvanceRefusalReason::Unavailable,
                 "an occupied slot refuses new advances as Unavailable"
             ),
             other => panic!("new advances refuse until recovery, got {other:?}"),

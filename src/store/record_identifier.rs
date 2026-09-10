@@ -34,7 +34,7 @@ impl RecordIdentifierMint {
         Self {
             used_identifiers: records
                 .iter()
-                .map(|record| record.record_identifier.payload().clone())
+                .map(|record| record.record_identifier.clone())
                 .collect(),
         }
     }

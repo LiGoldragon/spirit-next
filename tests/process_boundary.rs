@@ -5,7 +5,6 @@ use std::{
     io::{BufRead, BufReader},
     path::Path,
     process::{ChildStdout, Command, Stdio},
-    str::FromStr,
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -15,29 +14,23 @@ use support::{
     process::{CommandIsolation, ManagedChild},
 };
 
-use nota::NotaEncode;
-#[cfg(feature = "testing-trace")]
-use nota::NotaSource;
-#[cfg(feature = "agent-guardian")]
-use signal_frame::{ExchangeFrameBody, NonEmpty, Reply, ShortHeader, SubReply};
+use datom_codec::{Actualizing, Budget, Datomizable, Potential};
+use nexus::Configurable;
+use protos::ReaderBudget;
+use protos::{Protosizable, Textualizable};
+use signal_domain::{Domain, KinshipDomain};
 #[cfg(feature = "testing-trace")]
 use signal_introspect::ComponentTraceEvent;
 #[cfg(feature = "agent-guardian")]
-use signal_spirit::{
-    ConfigurationPath, SpiritGuardianAgentConfiguration, SpiritGuardianTimeoutMilliseconds,
-};
-#[cfg(feature = "agent-guardian")]
 use signal_spirit_judge::{
-    AdmissionJudgeResponse, AdmissionJudgeVerdict, JudgeDiagnostic, RedactedText, SpiritJudgeFrame,
-    SpiritJudgeReply, SpiritJudgeRequest,
+    AdmissionJudgeResponse, AdmissionJudgeVerdict, ByteViewable, JudgeDiagnostic,
+    Query as SpiritJudgeQuery, Response as SpiritJudgeResponse, Restorable, Signal, Signalizable,
 };
-use spirit::Configuration;
 use spirit::schema::signal::{
-    Antecedent, ClarificationRecordIdentifier, ClarificationResolution, Description, Domain,
-    Domains, Input, IntentEvent, Justification, Kind, Kinship, Magnitude, Output, QuoteText,
-    Reasoning, RecordIdentifier, TargetClarification, TargetClarifications, Testimony,
-    VerbatimQuote,
+    ClarificationResolution, IntentEvent, Justification, Kind, Magnitude, Query, RecordIdentifier,
+    Response, TargetClarification, VerbatimQuote,
 };
+use spirit::{Configuration, Store};
 #[cfg(feature = "agent-guardian")]
 use std::{
     io::{Read, Write},
@@ -48,6 +41,22 @@ use std::{
     },
 };
 use tempfile::TempDir;
+
+/// Locates a workspace executable built by the split-package test command.
+/// Integration tests deliberately execute the separately packaged clients and
+/// Nexus rather than a compatibility binary from the library package.
+fn workspace_binary(name: &str) -> std::path::PathBuf {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let binary = target.join("debug").join(name);
+    assert!(
+        binary.is_file(),
+        "workspace executable {} is not built; run cargo build --workspace first",
+        binary.display()
+    );
+    binary
+}
 
 struct DaemonProcess {
     child: ManagedChild,
@@ -115,34 +124,23 @@ impl FakeSpiritJudge {
     }
 
     fn answer(stream: &mut UnixStream) {
-        let request_frame = FrameIo::new(stream).read_frame();
-        let ExchangeFrameBody::Request { exchange, request } = request_frame.into_body() else {
-            panic!("expected typed spirit judge request frame");
-        };
-        let request_payload = request.payloads().head().clone();
-        let reply = match request_payload {
-            SpiritJudgeRequest::JudgeAdmission(_) => {
-                SpiritJudgeReply::AdmissionJudged(AdmissionJudgeResponse::new(
-                    AdmissionJudgeVerdict::Accept,
-                    Self::diagnostic("accepted by process-boundary fake judge"),
-                ))
+        let request = FrameIo::new(stream).read_query();
+        let reply = match request {
+            SpiritJudgeQuery::JudgeAdmission(_) => {
+                SpiritJudgeResponse::AdmissionJudged(AdmissionJudgeResponse {
+                    admission_judge_verdict: AdmissionJudgeVerdict::Accept,
+                    judge_diagnostic: Self::diagnostic("accepted by process-boundary fake judge"),
+                })
             }
         };
-        let reply_frame = SpiritJudgeFrame::with_short_header(
-            ShortHeader::empty(),
-            ExchangeFrameBody::Reply {
-                exchange,
-                reply: Reply::committed(
-                    NonEmpty::try_from_vec(vec![SubReply::Ok(reply)])
-                        .expect("reply list is non-empty"),
-                ),
-            },
-        );
-        FrameIo::new(stream).write_frame(&reply_frame);
+        FrameIo::new(stream).write_response(&reply);
     }
 
     fn diagnostic(text: &str) -> JudgeDiagnostic {
-        JudgeDiagnostic::redacted(RedactedText::new(text).expect("diagnostic is non-empty"))
+        JudgeDiagnostic {
+            redacted_text: text.into(),
+            content_hashes: vec![],
+        }
     }
 
     fn socket_path(&self) -> &Path {
@@ -160,31 +158,29 @@ impl<'stream> FrameIo<'stream> {
     fn new(stream: &'stream mut UnixStream) -> Self {
         Self { stream }
     }
-
-    fn read_frame(&mut self) -> SpiritJudgeFrame {
+    fn read_query(&mut self) -> SpiritJudgeQuery {
         let mut prefix = [0_u8; 4];
         self.stream
             .read_exact(&mut prefix)
-            .expect("read spirit judge frame prefix");
-        let length = u32::from_be_bytes(prefix) as usize;
-        let mut bytes = Vec::with_capacity(4 + length);
-        bytes.extend_from_slice(&prefix);
-        bytes.resize(4 + length, 0);
-        self.stream
-            .read_exact(&mut bytes[4..])
-            .expect("read spirit judge frame body");
-        SpiritJudgeFrame::decode_length_prefixed(bytes.as_slice())
-            .expect("decode spirit judge frame")
+            .expect("read judge prefix");
+        let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize];
+        self.stream.read_exact(&mut bytes).expect("read judge body");
+        Signal::<SpiritJudgeQuery>::from(bytes)
+            .restore()
+            .expect("restore judge query")
     }
-
-    fn write_frame(&mut self, frame: &SpiritJudgeFrame) {
-        let bytes = frame
-            .encode_length_prefixed()
-            .expect("encode spirit judge frame");
+    fn write_response(&mut self, response: &SpiritJudgeResponse) {
+        let signal = response.signalize().expect("archive judge response");
+        let bytes = signal.bytes();
         self.stream
-            .write_all(bytes.as_slice())
-            .expect("write spirit judge frame");
-        self.stream.flush().expect("flush spirit judge frame");
+            .write_all(
+                &u32::try_from(bytes.len())
+                    .expect("judge frame length")
+                    .to_be_bytes(),
+            )
+            .expect("write judge prefix");
+        self.stream.write_all(bytes).expect("write judge body");
+        self.stream.flush().expect("flush judge response");
     }
 }
 
@@ -203,24 +199,30 @@ impl DaemonProcess {
         configuration: Configuration,
         spirit_judge: &FakeSpiritJudge,
     ) -> Configuration {
-        Configuration::from_raw(
-            configuration
-                .raw()
-                .clone()
-                .with_guardian_agent_configuration(SpiritGuardianAgentConfiguration::new(
-                    ConfigurationPath::new(
-                        spirit_judge.socket_path().to_string_lossy().into_owned(),
-                    ),
-                    None,
-                    None,
-                    SpiritGuardianTimeoutMilliseconds::new(5_000),
-                    None,
-                )),
+        Configuration::from_raw_at_database(
+            signal_spirit::SpiritNexusConfiguration {
+                socket_path: configuration.raw().socket_path.clone(),
+                optional_meta_socket_path: configuration.raw().optional_meta_socket_path.clone(),
+                optional_trace_socket_path: configuration.raw().optional_trace_socket_path.clone(),
+                authorization_mode: configuration.raw().authorization_mode.clone(),
+                optional_spirit_guardian_agent_configuration: Some(
+                    signal_spirit::SpiritGuardianAgentConfiguration {
+                        agent_socket_path: spirit_judge
+                            .socket_path()
+                            .to_string_lossy()
+                            .into_owned(),
+                        optional_spirit_guardian_provider_name: None,
+                        optional_spirit_guardian_model_name: None,
+                        spirit_guardian_timeout_milliseconds: 5_000,
+                        optional_spirit_guardian_maximum_output_tokens: None,
+                    },
+                ),
+            },
+            configuration.database_path().to_path_buf(),
         )
     }
 
     fn spawn(socket_path: &Path, database_path: &Path) -> Self {
-        let configuration_path = socket_path.with_extension("config.rkyv");
         let meta_socket_path = Self::meta_socket_path(socket_path);
         #[cfg(feature = "agent-guardian")]
         let spirit_judge = Self::spirit_judge(socket_path);
@@ -228,11 +230,9 @@ impl DaemonProcess {
             Configuration::new(socket_path, database_path).with_meta_socket_path(&meta_socket_path);
         #[cfg(feature = "agent-guardian")]
         let configuration = Self::configuration_with_guardian(configuration, &spirit_judge);
-        configuration
-            .write_binary_file(&configuration_path)
-            .expect("write binary daemon configuration");
-        let mut command = Command::isolated(env!("CARGO_BIN_EXE_spirit-daemon"));
-        command.arg(configuration_path);
+        let state_home = Self::seed_zero_argument_configuration(&configuration);
+        let mut command = Command::isolated(workspace_binary("spirit-nexus"));
+        command.env("XDG_STATE_HOME", state_home);
         let child = ManagedChild::spawn(&mut command, "Spirit daemon").expect("spawn daemon");
         let mut process = Self {
             child,
@@ -250,61 +250,35 @@ impl DaemonProcess {
         process
     }
 
-    fn spawn_from_configuration_writer(socket_path: &Path, database_path: &Path) -> Self {
-        let configuration_path = socket_path.with_extension("config.rkyv");
-        let meta_socket_path = Self::meta_socket_path(socket_path);
-        #[cfg(feature = "agent-guardian")]
-        let spirit_judge = Self::spirit_judge(socket_path);
-        #[cfg(not(feature = "agent-guardian"))]
-        let request = format!(
-            "(ConfigurationWriteRequest ({} (Some {}) {} None Gating None {}))",
-            nota_path(socket_path),
-            nota_path(&meta_socket_path),
-            nota_path(database_path),
-            nota_path(&configuration_path)
-        );
-        #[cfg(feature = "agent-guardian")]
-        let request = format!(
-            "(ConfigurationWriteRequest ({} (Some {}) {} None Gating (Some ({} None None 5000 None)) {}))",
-            nota_path(socket_path),
-            nota_path(&meta_socket_path),
-            nota_path(database_path),
-            nota_path(spirit_judge.socket_path()),
-            nota_path(&configuration_path)
-        );
-        let output = Command::isolated(env!("CARGO_BIN_EXE_spirit-write-configuration"))
-            .arg(request)
-            .output()
-            .expect("run configuration writer");
-        assert!(
-            output.status.success(),
-            "configuration writer stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout =
-            String::from_utf8(output.stdout).expect("configuration writer stdout is UTF-8");
-        assert_eq!(
-            stdout.trim(),
-            format!("(ConfigurationWritten {})", nota_path(&configuration_path))
-        );
-        let mut command = Command::isolated(env!("CARGO_BIN_EXE_spirit-daemon"));
-        command.arg(configuration_path);
-        let child = ManagedChild::spawn(&mut command, "Spirit daemon")
-            .expect("spawn daemon from writer-built configuration");
-        let mut process = Self {
-            child,
-            #[cfg(feature = "agent-guardian")]
-            _spirit_judge: spirit_judge,
-        };
-        process
-            .child
-            .wait_for_unix_socket(socket_path, Duration::from_secs(5))
-            .expect("working socket readiness");
-        process
-            .child
-            .wait_for_unix_socket(&meta_socket_path, Duration::from_secs(5))
-            .expect("meta socket readiness");
-        process
+    /// Seed the isolated established XDG location before zero-argument Nexus
+    /// startup. No serialized configuration is passed to the daemon.
+    fn seed_zero_argument_configuration(configuration: &Configuration) -> std::path::PathBuf {
+        let database_path = configuration.database_path();
+        let parent = database_path.parent().expect("test database parent");
+        let file_stem = database_path
+            .file_stem()
+            .expect("test database name")
+            .to_string_lossy();
+        let state_home = parent.join(format!("{file_stem}.xdg-state"));
+        let stable_directory = state_home.join("spirit");
+        let stable_database = stable_directory.join("spirit.sema");
+        fs::create_dir_all(&stable_directory).expect("create isolated XDG Spirit state");
+        if !stable_database.exists() {
+            std::os::unix::fs::symlink(database_path, &stable_database)
+                .expect("link isolated stable Sema to test database");
+        }
+        let store = Store::open_with_configuration(database_path, configuration.raw().clone())
+            .expect("open isolated persisted Nexus configuration");
+        let mut lifecycle = store
+            .nexus_configuration_state()
+            .expect("read isolated persisted Nexus configuration");
+        lifecycle
+            .ordinary_configure_if_unset(configuration.raw().clone())
+            .expect("ordinary Configure remains available before meta Configure");
+        store
+            .replace_nexus_configuration(lifecycle)
+            .expect("persist isolated ordinary Configure");
+        state_home
     }
 
     #[cfg(feature = "testing-trace")]
@@ -313,7 +287,6 @@ impl DaemonProcess {
         database_path: &Path,
         trace_socket_path: &Path,
     ) -> Self {
-        let configuration_path = socket_path.with_extension("config.rkyv");
         let meta_socket_path = Self::meta_socket_path(socket_path);
         #[cfg(feature = "agent-guardian")]
         let spirit_judge = Self::spirit_judge(socket_path);
@@ -322,11 +295,9 @@ impl DaemonProcess {
                 .with_meta_socket_path(&meta_socket_path);
         #[cfg(feature = "agent-guardian")]
         let configuration = Self::configuration_with_guardian(configuration, &spirit_judge);
-        configuration
-            .write_binary_file(&configuration_path)
-            .expect("write binary daemon configuration with trace socket");
-        let mut command = Command::isolated(env!("CARGO_BIN_EXE_spirit-daemon"));
-        command.arg(configuration_path);
+        let state_home = Self::seed_zero_argument_configuration(&configuration);
+        let mut command = Command::isolated(workspace_binary("spirit-nexus"));
+        command.env("XDG_STATE_HOME", state_home);
         let child = ManagedChild::spawn(&mut command, "Spirit trace daemon").expect("spawn daemon");
         let mut process = Self {
             child,
@@ -353,16 +324,19 @@ fn configuration_writer_accepts_judge_socket_without_output_budget() {
     let database_path = directory.path().join("spirit.sema");
     let judge_socket_path = directory.path().join("spirit-judge.sock");
     let configuration_path = directory.path().join("spirit.config.rkyv");
-    let request = format!(
-        "(ConfigurationWriteRequest ({} (Some {}) {} None Gating (Some ({} None None 120000 None)) {}))",
-        nota_path(&socket_path),
-        nota_path(&meta_socket_path),
-        nota_path(&database_path),
-        nota_path(&judge_socket_path),
-        nota_path(&configuration_path)
+    let request = writer_request(
+        &socket_path,
+        &meta_socket_path,
+        &database_path,
+        Some(&judge_socket_path),
+        120_000,
+        None,
+        None,
+        &configuration_path,
+        "Gating",
     );
 
-    let output = Command::isolated(env!("CARGO_BIN_EXE_spirit-write-configuration"))
+    let output = Command::isolated(workspace_binary("spirit-write-configuration"))
         .arg(request)
         .output()
         .expect("run configuration writer");
@@ -376,14 +350,49 @@ fn configuration_writer_accepts_judge_socket_without_output_budget() {
         Configuration::from_binary_path(&configuration_path).expect("decode binary config");
     let guardian = configuration
         .raw()
-        .guardian_agent_configuration()
+        .optional_spirit_guardian_agent_configuration
+        .as_ref()
         .expect("legacy guardian configuration carries judge socket");
     assert_eq!(
-        guardian.agent_socket_path(),
+        guardian.agent_socket_path,
         judge_socket_path.to_string_lossy()
     );
-    assert_eq!(guardian.timeout_milliseconds(), 120_000);
-    assert_eq!(guardian.maximum_output_tokens(), None);
+    assert_eq!(guardian.spirit_guardian_timeout_milliseconds, 120_000);
+    assert_eq!(
+        guardian.optional_spirit_guardian_maximum_output_tokens,
+        None
+    );
+}
+
+#[test]
+fn configuration_writer_rejects_negative_guardian_numbers_without_writing_archive() {
+    let directory = TempDir::new().expect("tempdir");
+    let socket_path = directory.path().join("spirit.sock");
+    let meta_socket_path = directory.path().join("meta.sock");
+    let database_path = directory.path().join("spirit.sema");
+    let judge_socket_path = directory.path().join("spirit-judge.sock");
+    let configuration_path = directory.path().join("rejected.config.rkyv");
+    let request = writer_request(
+        &socket_path,
+        &meta_socket_path,
+        &database_path,
+        Some(&judge_socket_path),
+        -1,
+        None,
+        None,
+        &configuration_path,
+        "Gating",
+    );
+    let output = Command::isolated(workspace_binary("spirit-write-configuration"))
+        .arg(request)
+        .output()
+        .expect("run configuration writer");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("timeout must be non-negative"));
+    assert!(
+        !configuration_path.exists(),
+        "rejected input must not write an archive"
+    );
 }
 
 #[cfg(feature = "agent-guardian")]
@@ -395,16 +404,19 @@ fn configuration_writer_omitted_legacy_provider_stays_unowned_by_daemon_judge() 
     let database_path = directory.path().join("spirit.sema");
     let judge_socket_path = directory.path().join("spirit-judge.sock");
     let configuration_path = directory.path().join("spirit.config.rkyv");
-    let request = format!(
-        "(ConfigurationWriteRequest ({} (Some {}) {} None Gating (Some ({} None None 180000 None)) {}))",
-        nota_path(&socket_path),
-        nota_path(&meta_socket_path),
-        nota_path(&database_path),
-        nota_path(&judge_socket_path),
-        nota_path(&configuration_path)
+    let request = writer_request(
+        &socket_path,
+        &meta_socket_path,
+        &database_path,
+        Some(&judge_socket_path),
+        180_000,
+        None,
+        None,
+        &configuration_path,
+        "Gating",
     );
 
-    let output = Command::isolated(env!("CARGO_BIN_EXE_spirit-write-configuration"))
+    let output = Command::isolated(workspace_binary("spirit-write-configuration"))
         .arg(request)
         .output()
         .expect("run configuration writer");
@@ -418,16 +430,27 @@ fn configuration_writer_omitted_legacy_provider_stays_unowned_by_daemon_judge() 
         Configuration::from_binary_path(&configuration_path).expect("decode binary config");
     let raw_guardian = configuration
         .raw()
-        .guardian_agent_configuration()
+        .optional_spirit_guardian_agent_configuration
+        .as_ref()
         .expect("raw compatibility configuration");
-    assert_eq!(raw_guardian.provider_name(), None);
-    assert_eq!(raw_guardian.model_name(), None);
+    assert_eq!(
+        raw_guardian
+            .optional_spirit_guardian_provider_name
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        raw_guardian.optional_spirit_guardian_model_name.as_deref(),
+        None
+    );
     let judge = configuration
-        .guardian_agent_configuration()
+        .raw()
+        .optional_spirit_guardian_agent_configuration
+        .as_ref()
         .expect("daemon judge configuration");
-    assert_eq!(judge.socket_path(), judge_socket_path.as_path());
-    assert_eq!(judge.provider_name(), None);
-    assert_eq!(judge.model_name(), None);
+    assert_eq!(judge.agent_socket_path, judge_socket_path.to_string_lossy());
+    assert_eq!(judge.optional_spirit_guardian_provider_name, None);
+    assert_eq!(judge.optional_spirit_guardian_model_name, None);
 }
 
 #[cfg(feature = "agent-guardian")]
@@ -439,18 +462,19 @@ fn legacy_provider_model_fields_are_ignored_by_daemon_judge_configuration() {
     let database_path = directory.path().join("spirit.sema");
     let judge_socket_path = directory.path().join("spirit-judge.sock");
     let configuration_path = directory.path().join("spirit.config.rkyv");
-    let request = format!(
-        "(ConfigurationWriteRequest ({} (Some {}) {} None Gating (Some ({} (Some {}) (Some {}) 180000 None)) {}))",
-        nota_path(&socket_path),
-        nota_path(&meta_socket_path),
-        nota_path(&database_path),
-        nota_path(&judge_socket_path),
-        String::from("legacy-provider").to_nota(),
-        String::from("legacy-model").to_nota(),
-        nota_path(&configuration_path)
+    let request = writer_request(
+        &socket_path,
+        &meta_socket_path,
+        &database_path,
+        Some(&judge_socket_path),
+        180_000,
+        Some("legacy-provider"),
+        Some("legacy-model"),
+        &configuration_path,
+        "Gating",
     );
 
-    let output = Command::isolated(env!("CARGO_BIN_EXE_spirit-write-configuration"))
+    let output = Command::isolated(workspace_binary("spirit-write-configuration"))
         .arg(request)
         .output()
         .expect("run configuration writer");
@@ -464,14 +488,23 @@ fn legacy_provider_model_fields_are_ignored_by_daemon_judge_configuration() {
         Configuration::from_binary_path(&configuration_path).expect("decode binary config");
     let raw_guardian = configuration
         .raw()
-        .guardian_agent_configuration()
+        .optional_spirit_guardian_agent_configuration
+        .as_ref()
         .expect("raw compatibility configuration");
-    assert_eq!(raw_guardian.provider_name(), Some("legacy-provider"));
-    assert_eq!(raw_guardian.model_name(), Some("legacy-model"));
+    assert_eq!(
+        raw_guardian
+            .optional_spirit_guardian_provider_name
+            .as_deref(),
+        Some("legacy-provider")
+    );
+    assert_eq!(
+        raw_guardian.optional_spirit_guardian_model_name.as_deref(),
+        Some("legacy-model")
+    );
     let judge = configuration
         .guardian_agent_configuration()
         .expect("daemon judge configuration");
-    assert_eq!(judge.socket_path(), judge_socket_path.as_path());
+    assert_eq!(judge.socket_path(), judge_socket_path);
     assert_eq!(judge.provider_name(), None);
     assert_eq!(judge.model_name(), None);
     assert_eq!(judge.timeout().as_millis(), 180_000);
@@ -484,15 +517,19 @@ fn configuration_writer_encodes_observing_authorization_mode() {
     let meta_socket_path = directory.path().join("meta.sock");
     let database_path = directory.path().join("spirit.sema");
     let configuration_path = directory.path().join("spirit.config.rkyv");
-    let request = format!(
-        "(ConfigurationWriteRequest ({} (Some {}) {} None Observing None {}))",
-        nota_path(&socket_path),
-        nota_path(&meta_socket_path),
-        nota_path(&database_path),
-        nota_path(&configuration_path)
+    let request = writer_request(
+        &socket_path,
+        &meta_socket_path,
+        &database_path,
+        None,
+        0,
+        None,
+        None,
+        &configuration_path,
+        "Observing",
     );
 
-    let output = Command::isolated(env!("CARGO_BIN_EXE_spirit-write-configuration"))
+    let output = Command::isolated(workspace_binary("spirit-write-configuration"))
         .arg(request)
         .output()
         .expect("run configuration writer");
@@ -513,11 +550,11 @@ fn configuration_writer_encodes_observing_authorization_mode() {
 }
 
 impl SubscriberProcess {
-    fn spawn(socket_path: &Path, nota_argument: &str) -> Self {
-        let mut command = Command::isolated(env!("CARGO_BIN_EXE_spirit"));
+    fn spawn(socket_path: &Path, query: Query) -> Self {
+        let mut command = Command::isolated(workspace_binary("spirit"));
         command
             .env("SPIRIT_SOCKET", socket_path)
-            .arg(nota_argument)
+            .arg(query.datomize(vec![]).protosize().textualize())
             .stdout(Stdio::piped());
         let mut child =
             ManagedChild::spawn(&mut command, "Spirit subscriber").expect("spawn subscriber cli");
@@ -530,13 +567,13 @@ impl SubscriberProcess {
         }
     }
 
-    fn next_output(&self, timeout: Duration) -> Output {
+    fn next_output(&self, timeout: Duration) -> Response {
         let line = self
             .lines
             .recv_timeout(timeout)
             .expect("subscriber output before timeout");
-        Output::from_str(line.trim()).unwrap_or_else(|error| {
-            panic!("schema-emitted Output::FromStr on subscriber stdout {line:?}: {error}")
+        actualize_response(line.trim()).unwrap_or_else(|error| {
+            panic!("Datom response on subscriber stdout {line:?}: {error:?}")
         })
     }
 
@@ -573,10 +610,24 @@ impl SubscriberOutput {
     }
 }
 
-fn run_cli(socket_path: &Path, nota_argument: &str) -> Output {
-    let output = Command::isolated(env!("CARGO_BIN_EXE_spirit"))
+fn actualize_response(text: &str) -> Result<Response, datom_codec::Error> {
+    let mut pending = Potential::<Response>::from(text.to_owned());
+    pending.actualize(&mut Budget {
+        remaining: 1024,
+        reader: ReaderBudget { remaining: 1024 },
+        depth: 0,
+        maximum_depth: 1024,
+    })
+}
+
+fn run_cli(socket_path: &Path, query: Query) -> Response {
+    run_cli_raw(socket_path, query.datomize(vec![]).protosize().textualize())
+}
+
+fn run_cli_raw(socket_path: &Path, datom_argument: impl AsRef<str>) -> Response {
+    let output = Command::isolated(workspace_binary("spirit"))
         .env("SPIRIT_SOCKET", socket_path)
-        .arg(nota_argument)
+        .arg(datom_argument.as_ref())
         .output()
         .expect("run cli");
     assert!(
@@ -585,9 +636,9 @@ fn run_cli(socket_path: &Path, nota_argument: &str) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("cli stdout is UTF-8");
-    Output::from_str(stdout.trim()).unwrap_or_else(|error| {
+    actualize_response(stdout.trim()).unwrap_or_else(|error| {
         panic!(
-            "schema-emitted Output::FromStr on CLI stdout {:?}: {error}",
+            "Datom response on CLI stdout {:?}: {error:?}",
             stdout.trim()
         )
     })
@@ -599,10 +650,7 @@ fn public_clis_reject_non_object_and_file_operands_before_transport() {
     let nota_file = temp.path().join("must-not-read.nota");
     fs::write(&nota_file, "Version").expect("write sentinel file");
 
-    for binary in [
-        env!("CARGO_BIN_EXE_spirit"),
-        env!("CARGO_BIN_EXE_meta-spirit"),
-    ] {
+    for binary in [workspace_binary("spirit"), workspace_binary("spirit-meta")] {
         for arguments in [
             Vec::<String>::new(),
             vec![String::from("--help")],
@@ -610,7 +658,7 @@ fn public_clis_reject_non_object_and_file_operands_before_transport() {
             vec![String::from("Version"), String::from("Marker")],
             vec![nota_file.display().to_string()],
         ] {
-            let output = Command::isolated(binary)
+            let output = Command::isolated(&binary)
                 .env("SPIRIT_SOCKET", temp.path().join("unreachable.sock"))
                 .env(
                     "SPIRIT_META_SOCKET",
@@ -621,12 +669,12 @@ fn public_clis_reject_non_object_and_file_operands_before_transport() {
                 .expect("run public cli");
             assert!(
                 !output.status.success(),
-                "{binary} unexpectedly accepted arguments {arguments:?}"
+                "{binary:?} unexpectedly accepted arguments {arguments:?}"
             );
             if arguments == [nota_file.display().to_string()] {
                 assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("inline NOTA/DOTOS"),
-                    "{binary} must reject a file as an object boundary, stderr: {}",
+                    String::from_utf8_lossy(&output.stderr).contains("invalid Datom query"),
+                    "{binary:?} must reject a file as an object boundary, stderr: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
@@ -634,32 +682,86 @@ fn public_clis_reject_non_object_and_file_operands_before_transport() {
     }
 }
 
-fn record_nota(domains: &str, kind: &str, description: &str) -> String {
+fn datom_string(value: &Path) -> String {
+    format!("«{}»", value.display())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the process fixture mirrors the complete CLI request grammar"
+)]
+fn writer_request(
+    socket_path: &Path,
+    meta_socket_path: &Path,
+    _database_path: &Path,
+    guardian_socket_path: Option<&Path>,
+    timeout_milliseconds: i64,
+    provider_name: Option<&str>,
+    model_name: Option<&str>,
+    output_path: &Path,
+    authorization: &str,
+) -> String {
+    let guardian = match guardian_socket_path {
+        Some(path) => format!(
+            "Some.{{ {{ {} }} {} {} {{ {} }} {} }}",
+            datom_string(path),
+            provider_name
+                .map(|value| format!("Some.{{ {value} }}"))
+                .unwrap_or_else(|| "None".into()),
+            model_name
+                .map(|value| format!("Some.{{ {value} }}"))
+                .unwrap_or_else(|| "None".into()),
+            timeout_milliseconds,
+            "None",
+        ),
+        None => "None".into(),
+    };
     format!(
-        "(Record (({domains} {kind} [{description}] Minimum) ([([{description}] None)] [{description}])))"
+        "ConfigurationWriteRequest.{{ {{ {} }} Some.{{ {} }} None {} {} {{ {} }} }}",
+        datom_string(socket_path),
+        datom_string(meta_socket_path),
+        authorization,
+        guardian,
+        datom_string(output_path)
     )
 }
 
-fn resolve_clarification_nota(
+fn scopes(domains: Vec<Domain>) -> signal_domain::DomainScopes {
+    domains
+        .into_iter()
+        .map(|domain| signal_domain::DomainScope { domain })
+        .collect()
+}
+
+fn record_query(domains: Vec<Domain>, kind: Kind, description: &str) -> Query {
+    Query::Record(signal_spirit::RecordRequest {
+        entry: signal_spirit::Entry {
+            domains,
+            kind,
+            description: description.into(),
+            importance: Magnitude::Minimum,
+        },
+        justification: test_justification(description),
+    })
+}
+
+fn resolve_clarification(
     clarification_identifier: RecordIdentifier,
     target_identifier: RecordIdentifier,
     description: &str,
-) -> String {
-    Input::resolve_clarification(ClarificationResolution {
-        clarification_record_identifier: ClarificationRecordIdentifier::new(
-            clarification_identifier,
-        ),
-        target_clarifications: TargetClarifications::new(vec![TargetClarification {
+) -> Query {
+    Query::ResolveClarification(ClarificationResolution {
+        clarification_record_identifier: clarification_identifier,
+        target_clarifications: vec![TargetClarification {
             record_identifier: target_identifier,
-            description: Description::new(description),
-        }]),
+            description: description.into(),
+        }],
         justification: test_justification("a clarification means edit the target, not add more"),
     })
-    .to_nota()
 }
 
 fn assert_short_record_identifier(identifier: &RecordIdentifier) {
-    let payload = identifier.payload();
+    let payload = identifier;
     assert!(
         (4..=7).contains(&payload.len()),
         "record identifier should use a four-to-seven-character code: {payload}"
@@ -672,28 +774,20 @@ fn assert_short_record_identifier(identifier: &RecordIdentifier) {
     );
 }
 
-fn record_identifier_argument(identifier: &RecordIdentifier) -> String {
-    identifier.payload().to_string()
-}
-
 fn test_justification(statement: &str) -> Justification {
     Justification {
-        testimony: Testimony::new(vec![VerbatimQuote::new(
-            QuoteText::new(statement),
-            Some(Antecedent::new("test setup")),
-        )]),
-        reasoning: Reasoning::new(statement),
+        testimony: vec![VerbatimQuote {
+            quote_text: statement.into(),
+            optional_antecedent: Some("test setup".into()),
+        }],
+        reasoning: statement.into(),
     }
-}
-
-fn nota_path(path: &Path) -> String {
-    path.display().to_string().to_nota()
 }
 
 #[cfg(feature = "testing-trace")]
 #[derive(Debug)]
 struct TraceCliOutput {
-    output: Output,
+    output: Response,
     trace_lines: Vec<String>,
 }
 
@@ -703,8 +797,8 @@ impl TraceCliOutput {
         let stdout = String::from_utf8(stdout).expect("cli stdout is UTF-8");
         let mut lines = stdout.lines();
         let output_line = lines.next().expect("cli prints signal output");
-        let output = Output::from_str(output_line).unwrap_or_else(|error| {
-            panic!("schema-emitted Output::FromStr on CLI stdout {output_line:?}: {error}")
+        let output = actualize_response(output_line).unwrap_or_else(|error| {
+            panic!("Datom Response on CLI stdout {output_line:?}: {error:?}")
         });
         Self {
             output,
@@ -716,7 +810,7 @@ impl TraceCliOutput {
         let events = self.trace_events();
         let actual = events
             .iter()
-            .map(|event| event.event_name.as_str())
+            .map(|event| event.trace_event_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(actual, expected, "trace lines: {:#?}", self.trace_lines);
     }
@@ -725,7 +819,7 @@ impl TraceCliOutput {
         let events = self.trace_events();
         let mut actual = events
             .iter()
-            .map(|event| event.event_name.as_str())
+            .map(|event| event.trace_event_name.as_str())
             .collect::<Vec<_>>();
         let lifecycle_start = ["SemaStarted", "NexusStarted", "SignalStarted"];
         if actual.starts_with(&lifecycle_start) {
@@ -738,17 +832,17 @@ impl TraceCliOutput {
         self.trace_lines
             .iter()
             .map(|line| {
-                let event = NotaSource::new(line)
-                    .parse::<ComponentTraceEvent>()
+                let mut pending = Potential::<ComponentTraceEvent>::from(line.to_owned());
+                pending
+                    .actualize(&mut Budget {
+                        remaining: 1024,
+                        reader: ReaderBudget { remaining: 1024 },
+                        depth: 0,
+                        maximum_depth: 1024,
+                    })
                     .unwrap_or_else(|error| {
-                        panic!("trace CLI line should be component-trace NOTA {line:?}: {error}")
-                    });
-                assert_eq!(
-                    event.to_string(),
-                    *line,
-                    "trace CLI line should be canonical component-trace NOTA"
-                );
-                event
+                        panic!("trace CLI line should actualize {line:?}: {error:?}")
+                    })
             })
             .collect()
     }
@@ -758,12 +852,12 @@ impl TraceCliOutput {
 fn run_cli_with_trace(
     socket_path: &Path,
     trace_socket_path: &Path,
-    nota_argument: &str,
+    query: Query,
 ) -> TraceCliOutput {
-    let output = Command::isolated(env!("CARGO_BIN_EXE_spirit"))
+    let output = Command::isolated(workspace_binary("spirit"))
         .env("SPIRIT_SOCKET", socket_path)
         .env("SPIRIT_TRACE_SOCKET", trace_socket_path)
-        .arg(nota_argument)
+        .arg(query.datomize(vec![]).protosize().textualize())
         .output()
         .expect("run cli with trace");
     assert!(
@@ -775,26 +869,28 @@ fn run_cli_with_trace(
 }
 
 #[test]
-fn configuration_writer_prebuilds_binary_archive_for_daemon_startup() {
+fn daemon_starts_from_isolated_persisted_configuration() {
     let temp = TempDir::new().expect("tempdir");
     let socket_path = temp.path().join("written.sock");
     let database_path = temp.path().join("written.sema");
 
-    let _daemon = DaemonProcess::spawn_from_configuration_writer(&socket_path, &database_path);
+    let _daemon = DaemonProcess::spawn(&socket_path, &database_path);
 
     let recorded = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Technology (Software (Operations Deployment)))]",
-            "Constraint",
-            "daemon starts from prebuilt archive",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Constraint,
+            "daemon starts from persisted isolated configuration",
         ),
     );
     match recorded {
-        Output::RecordAccepted(receipt) => {
-            assert_short_record_identifier(receipt.payload());
+        Response::RecordAccepted(receipt) => {
+            assert_short_record_identifier(&receipt);
         }
-        other => panic!("expected RecordAccepted from writer-started daemon, got {other:?}"),
+        other => panic!("expected RecordAccepted from zero-argument daemon, got {other:?}"),
     }
 }
 
@@ -811,36 +907,46 @@ fn cli_and_daemon_exchange_nota_over_rkyv_socket() {
     // real content hash).
     let recorded = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Information Documentation)]",
-            "Constraint",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Constraint,
             "schema creates the interface",
         ),
     );
     match recorded {
-        Output::RecordAccepted(receipt) => {
-            assert_short_record_identifier(receipt.payload());
+        Response::RecordAccepted(receipt) => {
+            assert_short_record_identifier(&receipt);
         }
         other => panic!("expected RecordAccepted, got {other:?}"),
     };
 
     let observed = run_cli(
         &socket_path,
-        "(Observe ((Full [(Information Documentation)]) Any Any (Some Constraint) Any))",
+        Query::Observe(signal_spirit::Selection {
+            domain_match: signal_spirit::DomainMatch::Full(scopes(vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )])),
+            keyword_match: signal_spirit::KeywordMatch::Any,
+            text_match: signal_spirit::TextMatch::Any,
+            selected_kind: Some(Kind::Constraint),
+            importance_selection: signal_spirit::ImportanceSelection::Any,
+        }),
     );
     // Observe flows through Stash and returns both the recovery handle and
     // the observed records.
     assert!(
-        matches!(observed, Output::RecordsStashed(_)),
+        matches!(observed, Response::RecordsStashed(_)),
         "the daemon stashes and returns the observed records, got {observed:?}"
     );
 
     let rejected = run_cli(
         &socket_path,
-        &record_nota("[]", "Constraint", "schema rejects before SEMA"),
+        record_query(vec![], Kind::Constraint, "schema rejects before SEMA"),
     );
     assert!(
-        matches!(rejected, Output::Rejected(_)),
+        matches!(rejected, Response::Rejected(_)),
         "empty domain is rejected before SEMA, got {rejected:?}"
     );
 }
@@ -855,52 +961,50 @@ fn text_search_returns_direct_ranked_records() {
 
     let first = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Technology (Software (Distributed ProtocolDesign)))]",
-            "Decision",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Decision,
             "router.node.cluster.criome is the endpoint naming example",
         ),
     );
     assert!(
-        matches!(first, Output::RecordAccepted(_)),
+        matches!(first, Response::RecordAccepted(_)),
         "expected first search fixture to record, got {first:?}"
     );
     let second = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Technology (Software (Engineering Architecture)))]",
-            "Decision",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Decision,
             "Router owns the standardized routing protocol envelope",
         ),
     );
     assert!(
-        matches!(second, Output::RecordAccepted(_)),
+        matches!(second, Response::RecordAccepted(_)),
         "expected second search fixture to record, got {second:?}"
     );
 
-    let suffix_results = run_cli(&socket_path, "(TextSearch .criome)");
-    let Output::RecordsObserved(suffix_records) = suffix_results else {
+    let suffix_results = run_cli(&socket_path, Query::TextSearch("criome".into()));
+    let Response::RecordsObserved(suffix_records) = suffix_results else {
         panic!("TextSearch should return direct records, got {suffix_results:?}");
     };
-    assert_eq!(suffix_records.payload().payload().len(), 1);
+    assert_eq!(suffix_records.record_set.len(), 1);
     assert_eq!(
-        suffix_records.payload().payload()[0]
-            .entry
-            .description
-            .payload(),
+        suffix_records.record_set[0].entry.description,
         "router.node.cluster.criome is the endpoint naming example"
     );
 
-    let phrase_results = run_cli(&socket_path, "(TextSearch [routing protocol])");
-    let Output::RecordsObserved(phrase_records) = phrase_results else {
+    let phrase_results = run_cli(&socket_path, Query::TextSearch("routing protocol".into()));
+    let Response::RecordsObserved(phrase_records) = phrase_results else {
         panic!("TextSearch should return direct phrase records, got {phrase_results:?}");
     };
-    assert_eq!(phrase_records.payload().payload().len(), 1);
+    assert_eq!(phrase_records.record_set.len(), 1);
     assert_eq!(
-        phrase_records.payload().payload()[0]
-            .entry
-            .description
-            .payload(),
+        phrase_records.record_set[0].entry.description,
         "Router owns the standardized routing protocol envelope"
     );
 }
@@ -915,64 +1019,59 @@ fn cli_and_daemon_resolve_clarification_edits_target_and_removes_standalone() {
 
     let target = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Information Documentation)]",
-            "Decision",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Decision,
             "clarifications should not add more records",
         ),
     );
     let target_identifier = match target {
-        Output::RecordAccepted(receipt) => receipt.payload().clone(),
+        Response::RecordAccepted(receipt) => receipt.clone(),
         other => panic!("expected target RecordAccepted, got {other:?}"),
     };
 
     let standalone = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Information Documentation)]",
-            "Clarification",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Clarification,
             "bad standalone clarification to fold away",
         ),
     );
     let clarification_identifier = match standalone {
-        Output::RecordAccepted(receipt) => receipt.payload().clone(),
+        Response::RecordAccepted(receipt) => receipt.clone(),
         other => panic!("expected clarification RecordAccepted, got {other:?}"),
     };
 
     let resolved = run_cli(
         &socket_path,
-        &resolve_clarification_nota(
+        resolve_clarification(
             clarification_identifier.clone(),
             target_identifier.clone(),
             "clarifications edit target records instead of adding more records",
         ),
     );
     match resolved {
-        Output::ClarificationResolved(receipt) => {
+        Response::ClarificationResolved(receipt) => {
             assert_eq!(
-                receipt.payload().clarification_record_identifier.payload(),
-                &clarification_identifier
+                receipt.clarification_record_identifier,
+                clarification_identifier
             );
-            assert_eq!(
-                receipt.payload().record_identifiers.payload(),
-                &vec![target_identifier.clone()]
-            );
+            assert_eq!(receipt.record_identifiers, vec![target_identifier.clone()]);
         }
         other => panic!("expected ClarificationResolved, got {other:?}"),
     }
 
-    let found = run_cli(
-        &socket_path,
-        &format!(
-            "(Lookup {})",
-            record_identifier_argument(&target_identifier)
-        ),
-    );
+    let found = run_cli(&socket_path, Query::Lookup(target_identifier.clone()));
     match found {
-        Output::RecordFound(record) => {
+        Response::RecordFound(record) => {
             assert_eq!(record.record_identifier, target_identifier);
             assert_eq!(
-                record.entry.description.payload(),
+                record.entry.description,
                 "clarifications edit target records instead of adding more records"
             );
         }
@@ -981,13 +1080,10 @@ fn cli_and_daemon_resolve_clarification_edits_target_and_removes_standalone() {
 
     let missing = run_cli(
         &socket_path,
-        &format!(
-            "(Lookup {})",
-            record_identifier_argument(&clarification_identifier)
-        ),
+        Query::Lookup(clarification_identifier.clone()),
     );
     assert!(
-        matches!(missing, Output::Error(_)),
+        matches!(missing, Response::Error(_)),
         "standalone clarification should be removed, got {missing:?}"
     );
 }
@@ -1000,13 +1096,10 @@ fn cli_and_daemon_report_version_from_bare_nota_atom() {
 
     let _daemon = DaemonProcess::spawn(&socket_path, &database_path);
 
-    let version = run_cli(&socket_path, "Version");
+    let version = run_cli(&socket_path, Query::Version);
     match version {
-        Output::VersionReported(report) => {
-            assert_eq!(
-                report.payload().payload().payload(),
-                env!("CARGO_PKG_VERSION")
-            );
+        Response::VersionReported(report) => {
+            assert_eq!(report.version_text, env!("CARGO_PKG_VERSION"));
         }
         other => panic!("expected VersionReported from bare Version input, got {other:?}"),
     }
@@ -1021,54 +1114,61 @@ fn cli_subscription_receives_matching_intent_events_without_blocking_daemon() {
     let _daemon = DaemonProcess::spawn(&socket_path, &database_path);
     let subscriber = SubscriberProcess::spawn(
         &socket_path,
-        "(SubscribeIntent ((Full [(Kinship Rapport)]) Any Any (Some Decision) Any))",
+        Query::SubscribeIntent(signal_spirit::Selection {
+            domain_match: signal_spirit::DomainMatch::Full(scopes(vec![Domain::Kinship(
+                KinshipDomain::Rapport,
+            )])),
+            keyword_match: signal_spirit::KeywordMatch::Any,
+            text_match: signal_spirit::TextMatch::Any,
+            selected_kind: Some(Kind::Decision),
+            importance_selection: signal_spirit::ImportanceSelection::Any,
+        }),
     );
 
     match subscriber.next_output(Duration::from_secs(2)) {
-        Output::SubscriptionStarted(subscription) => {
-            assert_eq!(subscription.payload().payload().payload(), &1);
+        Response::SubscriptionStarted(subscription) => {
+            assert_eq!(subscription.subscription_token, 1);
         }
         other => panic!("expected SubscriptionStarted, got {other:?}"),
     }
 
     let nonmatching = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Information Documentation)]",
-            "Decision",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Decision,
             "this should not be pushed",
         ),
     );
     assert!(
-        matches!(nonmatching, Output::RecordAccepted(_)),
+        matches!(nonmatching, Response::RecordAccepted(_)),
         "ordinary record request should complete while subscription is open, got {nonmatching:?}"
     );
     subscriber.assert_no_output(Duration::from_millis(200));
 
     let matching = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Kinship Rapport)]",
-            "Decision",
+        record_query(
+            vec![Domain::Kinship(KinshipDomain::Rapport)],
+            Kind::Decision,
             "subscriber receives this",
         ),
     );
-    let Output::RecordAccepted(receipt) = matching else {
+    let Response::RecordAccepted(receipt) = matching else {
         panic!("expected matching RecordAccepted, got {matching:?}");
     };
 
     match subscriber.next_output(Duration::from_secs(2)) {
-        Output::Event(IntentEvent::IntentRecorded(recorded)) => {
+        Response::Event(IntentEvent::IntentRecorded(recorded)) => {
             assert_eq!(
                 recorded.entry.domains,
-                Domains::new(vec![Domain::Kinship(Kinship::Rapport)])
+                vec![Domain::Kinship(KinshipDomain::Rapport)]
             );
             assert_eq!(recorded.entry.kind, Kind::Decision);
-            assert_eq!(
-                recorded.entry.description.payload(),
-                "subscriber receives this"
-            );
-            assert_eq!(&recorded.record_identifier, receipt.payload());
+            assert_eq!(recorded.entry.description, "subscriber receives this");
+            assert_eq!(recorded.record_identifier, receipt);
         }
         other => panic!("expected IntentRecorded event, got {other:?}"),
     }
@@ -1082,70 +1182,64 @@ fn cli_and_daemon_classify_state_into_provisional_record() {
 
     let _daemon = DaemonProcess::spawn(&socket_path, &database_path);
 
-    let accepted = run_cli(&socket_path, "(State [daemon raw intent])");
+    let accepted = run_cli(
+        &socket_path,
+        Query::State(signal_spirit::Statement {
+            statement_text: "daemon raw intent".into(),
+        }),
+    );
     match accepted {
-        Output::RecordAccepted(receipt) => {
-            assert_short_record_identifier(receipt.payload());
+        Response::RecordAccepted(receipt) => {
+            assert_short_record_identifier(&receipt);
         }
         other => panic!("expected State to classify into RecordAccepted, got {other:?}"),
     }
 
     let observed = run_cli(
         &socket_path,
-        "(Observe ((Full [(Information Documentation)]) Any Any (Some Clarification) Any))",
+        Query::Observe(signal_spirit::Selection {
+            domain_match: signal_spirit::DomainMatch::Full(scopes(domain_fixtures::domains(&[
+                "documentation",
+            ]))),
+            keyword_match: signal_spirit::KeywordMatch::Any,
+            text_match: signal_spirit::TextMatch::Any,
+            selected_kind: Some(Kind::Clarification),
+            importance_selection: signal_spirit::ImportanceSelection::Any,
+        }),
     );
-    let Output::RecordsStashed(stashed) = observed else {
+    let Response::RecordsStashed(stashed) = observed else {
         panic!("expected classified State observation to be stashed, got {observed:?}");
     };
-    assert_eq!(*stashed.record_count.payload(), 1);
-    assert_eq!(stashed.observed_records.payload().payload().len(), 1);
+    assert_eq!(stashed.record_count, 1);
+    assert_eq!(stashed.observed_records.record_set.len(), 1);
     assert_eq!(
-        stashed.observed_records.payload().payload()[0]
-            .entry
-            .domains,
+        stashed.observed_records.record_set[0].entry.domains,
         domain_fixtures::domains(&["documentation"])
     );
     assert_eq!(
-        stashed.observed_records.payload().payload()[0].entry.kind,
+        stashed.observed_records.record_set[0].entry.kind,
         Kind::Clarification
     );
     assert_eq!(
-        stashed.observed_records.payload().payload()[0]
-            .entry
-            .description
-            .payload(),
+        stashed.observed_records.record_set[0].entry.description,
         "daemon raw intent"
     );
     assert_eq!(
-        stashed.observed_records.payload().payload()[0]
-            .entry
-            .importance,
-        Magnitude::Minimum.into()
+        stashed.observed_records.record_set[0].entry.importance,
+        Magnitude::Minimum
     );
 
-    let looked_up = run_cli(
-        &socket_path,
-        &format!("(LookupStash {})", stashed.stash_handle.payload()),
-    );
+    let looked_up = run_cli(&socket_path, Query::LookupStash(stashed.stash_handle));
     match looked_up {
-        Output::RecordsObserved(records) => {
-            assert_eq!(records.payload().payload().len(), 1);
+        Response::RecordsObserved(records) => {
+            assert_eq!(records.record_set.len(), 1);
             assert_eq!(
-                records.payload().payload()[0].entry.domains,
+                records.record_set[0].entry.domains,
                 domain_fixtures::domains(&["documentation"])
             );
-            assert_eq!(
-                records.payload().payload()[0].entry.kind,
-                Kind::Clarification
-            );
-            assert_eq!(
-                records.payload().payload()[0].entry.description.payload(),
-                "daemon raw intent"
-            );
-            assert_eq!(
-                records.payload().payload()[0].entry.importance,
-                Magnitude::Minimum.into()
-            );
+            assert_eq!(records.record_set[0].entry.kind, Kind::Clarification);
+            assert_eq!(records.record_set[0].entry.description, "daemon raw intent");
+            assert_eq!(records.record_set[0].entry.importance, Magnitude::Minimum);
         }
         other => panic!("expected LookupStash to return classified State record, got {other:?}"),
     }
@@ -1161,47 +1255,42 @@ fn cli_and_daemon_bump_importance_without_changing_record_identifier() {
 
     let accepted = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Information Documentation)]",
-            "Correction",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Correction,
             "importance target",
         ),
     );
     let record_identifier = match accepted {
-        Output::RecordAccepted(receipt) => {
-            assert_short_record_identifier(receipt.payload());
-            receipt.payload().clone()
+        Response::RecordAccepted(receipt) => {
+            assert_short_record_identifier(&receipt);
+            receipt.clone()
         }
         other => panic!("expected RecordAccepted before importance bump, got {other:?}"),
     };
 
     let changed = run_cli(
         &socket_path,
-        &format!(
-            "(BumpImportance {})",
-            record_identifier_argument(&record_identifier)
-        ),
+        Query::BumpImportance(signal_spirit::ImportanceBump {
+            record_identifier: record_identifier.clone(),
+        }),
     );
     match changed {
-        Output::ImportanceBumped(receipt) => {
-            assert_eq!(receipt.payload().record_identifier, record_identifier);
-            assert_eq!(receipt.payload().importance, Magnitude::VeryLow.into());
+        Response::ImportanceBumped(receipt) => {
+            assert_eq!(receipt.record_identifier, record_identifier);
+            assert_eq!(receipt.importance, Magnitude::VeryLow);
         }
         other => panic!("expected ImportanceBumped, got {other:?}"),
     }
 
-    let found = run_cli(
-        &socket_path,
-        &format!(
-            "(Lookup {})",
-            record_identifier_argument(&record_identifier)
-        ),
-    );
+    let found = run_cli(&socket_path, Query::Lookup(record_identifier.clone()));
     match found {
-        Output::RecordFound(record) => {
+        Response::RecordFound(record) => {
             assert_eq!(record.record_identifier, record_identifier);
-            assert_eq!(record.entry.description.payload(), "importance target");
-            assert_eq!(record.entry.importance, Magnitude::VeryLow.into());
+            assert_eq!(record.entry.description, "importance target");
+            assert_eq!(record.entry.importance, Magnitude::VeryLow);
         }
         other => panic!("expected changed record lookup, got {other:?}"),
     }
@@ -1217,61 +1306,73 @@ fn cli_and_daemon_change_record_replaces_entry_under_same_identifier() {
 
     let accepted = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Information Documentation)]",
-            "Decision",
+        record_query(
+            vec![Domain::Information(
+                signal_domain::InformationDomain::Documentation,
+            )],
+            Kind::Decision,
             "original record",
         ),
     );
     let record_identifier = match accepted {
-        Output::RecordAccepted(receipt) => {
-            assert_short_record_identifier(receipt.payload());
-            receipt.payload().clone()
+        Response::RecordAccepted(receipt) => {
+            assert_short_record_identifier(&receipt);
+            receipt.clone()
         }
         other => panic!("expected RecordAccepted before record change, got {other:?}"),
     };
 
     let changed = run_cli(
         &socket_path,
-        &format!(
-            "(ChangeRecord ({} ([(Information Documentation)] Correction [replacement record] Minimum) ([([replacement record] None)] [replacement record])))",
-            record_identifier_argument(&record_identifier)
-        ),
+        Query::ChangeRecord(signal_spirit::RecordChange {
+            record_identifier: record_identifier.clone(),
+            entry: signal_spirit::Entry {
+                domains: vec![Domain::Information(
+                    signal_domain::InformationDomain::Documentation,
+                )],
+                kind: Kind::Correction,
+                description: "replacement record".into(),
+                importance: Magnitude::Minimum,
+            },
+            justification: test_justification("replacement record"),
+        }),
     );
     match changed {
-        Output::RecordChanged(receipt) => {
-            assert_eq!(receipt.payload().payload(), &record_identifier);
+        Response::RecordChanged(receipt) => {
+            assert_eq!(receipt.record_identifier, record_identifier);
         }
         other => panic!("expected RecordChanged, got {other:?}"),
     }
 
-    let found = run_cli(
-        &socket_path,
-        &format!(
-            "(Lookup {})",
-            record_identifier_argument(&record_identifier)
-        ),
-    );
+    let found = run_cli(&socket_path, Query::Lookup(record_identifier.clone()));
     match found {
-        Output::RecordFound(record) => {
+        Response::RecordFound(record) => {
             assert_eq!(record.record_identifier, record_identifier);
             assert_eq!(
                 record.entry.domains,
                 domain_fixtures::domains(&["documentation"])
             );
             assert_eq!(record.entry.kind, Kind::Correction);
-            assert_eq!(record.entry.description.payload(), "replacement record");
-            assert_eq!(record.entry.importance, Magnitude::Minimum.into());
+            assert_eq!(record.entry.description, "replacement record");
+            assert_eq!(record.entry.importance, Magnitude::Minimum);
         }
         other => panic!("expected changed record lookup, got {other:?}"),
     }
 
     let missing_old_query = run_cli(
         &socket_path,
-        "(Observe ((Full [(Information Documentation)]) Any Any (Some Decision) Any))",
+        Query::Observe(signal_spirit::Selection {
+            domain_match: signal_spirit::DomainMatch::Full(scopes(domain_fixtures::domains(&[
+                "documentation",
+            ]))),
+            keyword_match: signal_spirit::KeywordMatch::Any,
+            text_match: signal_spirit::TextMatch::Any,
+            selected_kind: Some(Kind::Decision),
+            importance_selection: signal_spirit::ImportanceSelection::Any,
+        }),
     );
     assert!(
-        matches!(missing_old_query, Output::Error(_)),
+        matches!(missing_old_query, Response::Error(_)),
         "the original entry should be replaced, got {missing_old_query:?}"
     );
 }
@@ -1284,9 +1385,14 @@ fn cli_renders_alias_payload_outputs_without_wrapper_repetition() {
 
     let _daemon = DaemonProcess::spawn(&socket_path, &database_path);
 
-    let rejected = Command::isolated(env!("CARGO_BIN_EXE_spirit"))
+    let rejected = Command::isolated(workspace_binary("spirit"))
         .env("SPIRIT_SOCKET", &socket_path)
-        .arg(record_nota("[]", "Constraint", "alias payload rejection"))
+        .arg(
+            record_query(vec![], Kind::Constraint, "alias payload rejection")
+                .datomize(vec![])
+                .protosize()
+                .textualize(),
+        )
         .output()
         .expect("run cli");
     assert!(
@@ -1297,24 +1403,29 @@ fn cli_renders_alias_payload_outputs_without_wrapper_repetition() {
     let rejected_stdout = String::from_utf8(rejected.stdout).expect("cli stdout is UTF-8");
     assert_eq!(
         rejected_stdout.trim(),
-        "(Rejected EmptyDomain)",
+        "Rejected.{ EmptyDomain }",
         "Rejected aliases must render the direct SignalRejection payload without a Rejected wrapper"
     );
-    let rejected_output = Output::from_str(rejected_stdout.trim()).unwrap_or_else(|error| {
-        panic!("schema-emitted Output::FromStr on rejection stdout: {error}")
-    });
+    let rejected_output = actualize_response(rejected_stdout.trim()).expect("actualize rejection");
     assert!(
-        matches!(rejected_output, Output::Rejected(_)),
-        "parsed rejection should be direct Output::Rejected payload"
+        matches!(rejected_output, Response::Rejected(_)),
+        "parsed rejection should be direct Response::Rejected payload"
     );
 
-    let recorded = Command::isolated(env!("CARGO_BIN_EXE_spirit"))
+    let recorded = Command::isolated(workspace_binary("spirit"))
         .env("SPIRIT_SOCKET", &socket_path)
-        .arg(record_nota(
-            "[(Information Documentation)]",
-            "Constraint",
-            "direct accepted payload",
-        ))
+        .arg(
+            record_query(
+                vec![Domain::Information(
+                    signal_domain::InformationDomain::Documentation,
+                )],
+                Kind::Constraint,
+                "direct accepted payload",
+            )
+            .datomize(vec![])
+            .protosize()
+            .textualize(),
+        )
         .output()
         .expect("run cli");
     assert!(
@@ -1323,11 +1434,10 @@ fn cli_renders_alias_payload_outputs_without_wrapper_repetition() {
         String::from_utf8_lossy(&recorded.stderr)
     );
     let recorded_stdout = String::from_utf8(recorded.stdout).expect("cli stdout is UTF-8");
-    let recorded_output = Output::from_str(recorded_stdout.trim())
-        .unwrap_or_else(|error| panic!("schema-emitted Output::FromStr on record stdout: {error}"));
+    let recorded_output = actualize_response(recorded_stdout.trim()).expect("actualize record");
     match recorded_output {
-        Output::RecordAccepted(receipt) => {
-            assert_short_record_identifier(receipt.payload());
+        Response::RecordAccepted(receipt) => {
+            assert_short_record_identifier(&receipt);
         }
         other => panic!("parsed record reply should be direct RecordAccepted payload: {other:?}"),
     }
@@ -1349,15 +1459,15 @@ fn daemon_persists_sema_file_across_a_restart() {
         let _daemon = DaemonProcess::spawn(&socket_path, &database_path);
         let recorded = run_cli(
             &socket_path,
-            &record_nota(
-                "[(Technology (Software (Operations Deployment)))]",
-                "Decision",
+            record_query(
+                domain_fixtures::domains(&["deployment"]),
+                Kind::Decision,
                 "survives restart",
             ),
         );
         match recorded {
-            Output::RecordAccepted(receipt) => {
-                assert_short_record_identifier(receipt.payload());
+            Response::RecordAccepted(receipt) => {
+                assert_short_record_identifier(&receipt);
             }
             other => panic!("expected RecordAccepted from first daemon, got {other:?}"),
         }
@@ -1375,38 +1485,37 @@ fn daemon_persists_sema_file_across_a_restart() {
 
     let observed = run_cli(
         &socket_path,
-        "(Observe ((Full [(Technology (Software (Operations Deployment)))]) Any Any (Some Decision) Any))",
+        Query::Observe(signal_spirit::Selection {
+            domain_match: signal_spirit::DomainMatch::Full(scopes(domain_fixtures::domains(&[
+                "deployment",
+            ]))),
+            keyword_match: signal_spirit::KeywordMatch::Any,
+            text_match: signal_spirit::TextMatch::Any,
+            selected_kind: Some(Kind::Decision),
+            importance_selection: signal_spirit::ImportanceSelection::Any,
+        }),
     );
     // Observe returns records inline and a recovery stash handle. LookupStash
     // verifies the same content survived the daemon restart.
     let stash_handle = match observed {
-        Output::RecordsStashed(stashed) => {
+        Response::RecordsStashed(stashed) => {
             assert_eq!(
-                *stashed.record_count.payload(),
-                1,
+                stashed.record_count, 1,
                 "the restarted daemon observes one durable record"
             );
             assert_eq!(
-                stashed.observed_records.payload().payload()[0]
-                    .entry
-                    .description
-                    .payload(),
-                "survives restart",
+                stashed.observed_records.record_set[0].entry.description, "survives restart",
                 "the restarted daemon returns durable content inline"
             );
-            stashed.stash_handle.clone()
+            stashed.stash_handle
         }
         other => panic!("expected RecordsStashed after restart, got {other:?}"),
     };
-    let looked_up = run_cli(
-        &socket_path,
-        &format!("(LookupStash {})", stash_handle.payload()),
-    );
+    let looked_up = run_cli(&socket_path, Query::LookupStash(stash_handle));
     match looked_up {
-        Output::RecordsObserved(records) => {
+        Response::RecordsObserved(records) => {
             assert_eq!(
-                records.payload().payload()[0].entry.description.payload(),
-                "survives restart",
+                records.record_set[0].entry.description, "survives restart",
                 "the restarted daemon's stash retrieves the durable content"
             );
         }
@@ -1417,15 +1526,15 @@ fn daemon_persists_sema_file_across_a_restart() {
     // the durable counter persisted across the restart, not just records.
     let next = run_cli(
         &socket_path,
-        &record_nota(
-            "[(Technology (Software (Operations Deployment)))]",
-            "Decision",
+        record_query(
+            domain_fixtures::domains(&["deployment"]),
+            Kind::Decision,
             "second after restart",
         ),
     );
     match next {
-        Output::RecordAccepted(receipt) => {
-            assert_short_record_identifier(receipt.payload());
+        Response::RecordAccepted(receipt) => {
+            assert_short_record_identifier(&receipt);
         }
         other => panic!("expected RecordAccepted after restart, got {other:?}"),
     }
@@ -1442,15 +1551,15 @@ fn candidate_daemon_handover_from_production_copy_preserves_original_sema_databa
         let _daemon = DaemonProcess::spawn(&socket_path, &production_database_path);
         let recorded = run_cli(
             &socket_path,
-            &record_nota(
-                "[(Technology (Software (Operations Deployment)))]",
-                "Constraint",
+            record_query(
+                domain_fixtures::domains(&["deployment"]),
+                Kind::Constraint,
                 "production entry before copy",
             ),
         );
         match recorded {
-            Output::RecordAccepted(receipt) => {
-                assert_short_record_identifier(receipt.payload());
+            Response::RecordAccepted(receipt) => {
+                assert_short_record_identifier(&receipt);
             }
             other => panic!("expected production seed record, got {other:?}"),
         }
@@ -1464,7 +1573,15 @@ fn candidate_daemon_handover_from_production_copy_preserves_original_sema_databa
         let _daemon = DaemonProcess::spawn(&socket_path, &candidate_database_path);
         let observed = run_cli(
             &socket_path,
-            "(Observe ((Full [(Technology (Software (Operations Deployment)))]) Any Any (Some Constraint) Any))",
+            Query::Observe(signal_spirit::Selection {
+                domain_match: signal_spirit::DomainMatch::Full(scopes(domain_fixtures::domains(
+                    &["deployment"],
+                ))),
+                keyword_match: signal_spirit::KeywordMatch::Any,
+                text_match: signal_spirit::TextMatch::Any,
+                selected_kind: Some(Kind::Constraint),
+                importance_selection: signal_spirit::ImportanceSelection::Any,
+            }),
         );
         assert_eq!(
             stashed_descriptions(&socket_path, observed),
@@ -1474,22 +1591,30 @@ fn candidate_daemon_handover_from_production_copy_preserves_original_sema_databa
 
         let candidate_recorded = run_cli(
             &socket_path,
-            &record_nota(
-                "[(Technology (Software (Operations Deployment)))]",
-                "Constraint",
+            record_query(
+                domain_fixtures::domains(&["deployment"]),
+                Kind::Constraint,
                 "candidate-only entry after copy",
             ),
         );
         match candidate_recorded {
-            Output::RecordAccepted(receipt) => {
-                assert_short_record_identifier(receipt.payload());
+            Response::RecordAccepted(receipt) => {
+                assert_short_record_identifier(&receipt);
             }
             other => panic!("expected candidate record, got {other:?}"),
         }
 
         let candidate_observed = run_cli(
             &socket_path,
-            "(Observe ((Full [(Technology (Software (Operations Deployment)))]) Any Any (Some Constraint) Any))",
+            Query::Observe(signal_spirit::Selection {
+                domain_match: signal_spirit::DomainMatch::Full(scopes(domain_fixtures::domains(
+                    &["deployment"],
+                ))),
+                keyword_match: signal_spirit::KeywordMatch::Any,
+                text_match: signal_spirit::TextMatch::Any,
+                selected_kind: Some(Kind::Constraint),
+                importance_selection: signal_spirit::ImportanceSelection::Any,
+            }),
         );
         assert_eq!(
             stashed_descriptions(&socket_path, candidate_observed),
@@ -1506,7 +1631,15 @@ fn candidate_daemon_handover_from_production_copy_preserves_original_sema_databa
         let _daemon = DaemonProcess::spawn(&socket_path, &production_database_path);
         let observed = run_cli(
             &socket_path,
-            "(Observe ((Full [(Technology (Software (Operations Deployment)))]) Any Any (Some Constraint) Any))",
+            Query::Observe(signal_spirit::Selection {
+                domain_match: signal_spirit::DomainMatch::Full(scopes(domain_fixtures::domains(
+                    &["deployment"],
+                ))),
+                keyword_match: signal_spirit::KeywordMatch::Any,
+                text_match: signal_spirit::TextMatch::Any,
+                selected_kind: Some(Kind::Constraint),
+                importance_selection: signal_spirit::ImportanceSelection::Any,
+            }),
         );
         assert_eq!(
             stashed_descriptions(&socket_path, observed),
@@ -1516,15 +1649,15 @@ fn candidate_daemon_handover_from_production_copy_preserves_original_sema_databa
 
         let production_next = run_cli(
             &socket_path,
-            &record_nota(
-                "[(Technology (Software (Operations Deployment)))]",
-                "Constraint",
+            record_query(
+                domain_fixtures::domains(&["deployment"]),
+                Kind::Constraint,
                 "production entry after handover",
             ),
         );
         match production_next {
-            Output::RecordAccepted(receipt) => {
-                assert_short_record_identifier(receipt.payload());
+            Response::RecordAccepted(receipt) => {
+                assert_short_record_identifier(&receipt);
             }
             other => panic!("expected production post-handover record, got {other:?}"),
         }
@@ -1544,14 +1677,14 @@ fn cli_receives_testing_trace_events_from_daemon_trace_socket() {
     let recorded = run_cli_with_trace(
         &socket_path,
         &trace_socket_path,
-        &record_nota(
-            "[(Technology (Software (Engineering Architecture)))]",
-            "Constraint",
+        record_query(
+            domain_fixtures::domains(&["architecture"]),
+            Kind::Constraint,
             "trace crosses daemon boundary",
         ),
     );
     assert!(
-        matches!(recorded.output, Output::RecordAccepted(_)),
+        matches!(recorded.output, Response::RecordAccepted(_)),
         "record reply should still be the first CLI line, got {:?}",
         recorded.output
     );
@@ -1574,14 +1707,22 @@ fn cli_receives_testing_trace_events_from_daemon_trace_socket() {
     let observed = run_cli_with_trace(
         &socket_path,
         &trace_socket_path,
-        "(Observe ((Full [(Technology (Software (Engineering Architecture)))]) Any Any (Some Constraint) Any))",
+        Query::Observe(signal_spirit::Selection {
+            domain_match: signal_spirit::DomainMatch::Full(scopes(domain_fixtures::domains(&[
+                "architecture",
+            ]))),
+            keyword_match: signal_spirit::KeywordMatch::Any,
+            text_match: signal_spirit::TextMatch::Any,
+            selected_kind: Some(Kind::Constraint),
+            importance_selection: signal_spirit::ImportanceSelection::Any,
+        }),
     );
     // Observe flows through the recursive Nexus loop with Stash and returns
     // both the recovery handle and the observed records.
     // The trace below shows each continuation step: command SEMA read,
     // command Stash effect, then reply.
     assert!(
-        matches!(observed.output, Output::RecordsStashed(_)),
+        matches!(observed.output, Response::RecordsStashed(_)),
         "observe reply should still be the first CLI line, got {:?}",
         observed.output
     );
@@ -1600,19 +1741,80 @@ fn cli_receives_testing_trace_events_from_daemon_trace_socket() {
 }
 
 /// Observe returns records inline with a recovery Stash handle.
-fn stashed_descriptions(_socket_path: &Path, output: Output) -> Vec<String> {
+fn stashed_descriptions(_socket_path: &Path, output: Response) -> Vec<String> {
     match output {
-        Output::RecordsStashed(stashed) => {
+        Response::RecordsStashed(stashed) => {
             let mut descriptions: Vec<String> = stashed
                 .observed_records
-                .payload()
-                .payload()
+                .record_set
                 .iter()
-                .map(|record| record.entry.description.payload().clone())
+                .map(|record| record.entry.description.clone())
                 .collect();
             descriptions.sort();
             descriptions
         }
         other => panic!("expected RecordsStashed, got {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_rejects_all_legacy_admission_invalid_families_before_mutation() {
+    let temp = TempDir::new().expect("tempdir");
+    let socket_path = temp.path().join("admission.sock");
+    let database_path = temp.path().join("admission.sema");
+    let _daemon = DaemonProcess::spawn(&socket_path, &database_path);
+
+    let marker_before = match run_cli(&socket_path, Query::Marker) {
+        Response::MarkerReported(marker) => marker,
+        other => panic!("expected initial marker, got {other:?}"),
+    };
+    let justification = test_justification("valid justification");
+    let invalid = [
+        Query::Observe(signal_spirit::Selection {
+            domain_match: signal_spirit::DomainMatch::Full(vec![]),
+            keyword_match: signal_spirit::KeywordMatch::Any,
+            text_match: signal_spirit::TextMatch::Any,
+            selected_kind: None,
+            importance_selection: signal_spirit::ImportanceSelection::Any,
+        }),
+        Query::Record(signal_spirit::RecordRequest {
+            entry: signal_spirit::Entry {
+                domains: domain_fixtures::domains(&["documentation"]),
+                kind: Kind::Decision,
+                description: "entry".into(),
+                importance: Magnitude::Minimum,
+            },
+            justification: signal_spirit::Justification {
+                testimony: vec![],
+                reasoning: " ".into(),
+            },
+        }),
+        Query::ResolveClarification(signal_spirit::ClarificationResolution {
+            clarification_record_identifier: "missing".into(),
+            target_clarifications: vec![],
+            justification: justification.clone(),
+        }),
+        Query::Supersede(signal_spirit::Supersession {
+            retired_identifiers: vec![],
+            replacements: vec![],
+            justification: justification.clone(),
+        }),
+        Query::Retire(signal_spirit::Retirement {
+            record_identifier: "missing".into(),
+            justification: signal_spirit::Justification {
+                testimony: vec![],
+                reasoning: "".into(),
+            },
+        }),
+    ];
+    for query in invalid {
+        assert!(matches!(
+            run_cli(&socket_path, query),
+            Response::Rejected(_)
+        ));
+    }
+    match run_cli(&socket_path, Query::Marker) {
+        Response::MarkerReported(marker) => assert_eq!(marker, marker_before),
+        other => panic!("expected marker after rejected inputs, got {other:?}"),
     }
 }

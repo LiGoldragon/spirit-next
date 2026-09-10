@@ -7,92 +7,66 @@ use std::{
 use thiserror::Error;
 use triad_runtime::{FrameBody as LengthPrefixedFrameBody, FrameError, LengthPrefixedCodec};
 
-use crate::schema::signal::{
-    Frame as StreamingFrame, FrameBody as StreamingFrameBody, Input, InputRoute, IntentEvent,
-    Output, OutputRoute, SignalFrameError,
-};
+use signal_spirit::{ByteViewable, Query, Response, Restorable, Signal, Signalizable};
 
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("transport IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("signal frame error: {0}")]
-    SignalFrame(#[from] SignalFrameError),
-
-    #[error("streaming signal frame error: {0}")]
-    StreamingFrame(#[from] signal_frame::FrameError),
-
+    #[error("signal archive error: {0}")]
+    Signal(String),
     #[error("transport frame error: {0}")]
     Frame(#[from] FrameError),
-
-    #[error("expected subscription event frame")]
-    ExpectedSubscriptionEvent,
 }
 
 pub struct SignalTransport<Stream> {
     stream: Stream,
 }
-
 impl SignalTransport<UnixStream> {
     pub fn connect(socket_path: impl AsRef<Path>) -> Result<Self, TransportError> {
         Ok(Self::new(UnixStream::connect(socket_path)?))
     }
 }
-
-impl<Stream> SignalTransport<Stream>
-where
-    Stream: Read + Write,
-{
+impl<Stream: Read + Write> SignalTransport<Stream> {
     pub fn new(stream: Stream) -> Self {
         Self { stream }
     }
-
-    pub fn exchange(&mut self, input: &Input) -> Result<(OutputRoute, Output), TransportError> {
-        self.write_input(input)?;
+    pub fn exchange(&mut self, query: &Query) -> Result<Response, TransportError> {
+        self.write_input(query)?;
         self.read_output()
     }
-
-    pub fn write_input(&mut self, input: &Input) -> Result<(), TransportError> {
-        self.write_frame(input.encode_signal_frame()?)
+    pub fn write_input(&mut self, query: &Query) -> Result<(), TransportError> {
+        self.write_signal(query)
     }
-
-    pub fn read_input(&mut self) -> Result<(InputRoute, Input), TransportError> {
-        Ok(Input::decode_signal_frame(&self.read_frame()?)?)
+    pub fn read_input(&mut self) -> Result<Query, TransportError> {
+        self.read_signal()
     }
-
-    pub fn write_output(&mut self, output: &Output) -> Result<(), TransportError> {
-        self.write_frame(output.encode_signal_frame()?)
+    pub fn write_output(&mut self, response: &Response) -> Result<(), TransportError> {
+        self.write_signal(response)
     }
-
-    pub fn read_output(&mut self) -> Result<(OutputRoute, Output), TransportError> {
-        Ok(Output::decode_signal_frame(&self.read_frame()?)?)
+    pub fn read_output(&mut self) -> Result<Response, TransportError> {
+        self.read_signal()
     }
-
-    pub fn read_streaming_frame(&mut self) -> Result<StreamingFrame, TransportError> {
-        Ok(StreamingFrame::decode(&self.read_frame()?)?)
-    }
-
-    pub fn read_subscription_event(&mut self) -> Result<IntentEvent, TransportError> {
-        match self.read_streaming_frame()?.into_body() {
-            StreamingFrameBody::SubscriptionEvent { event, .. } => Ok(event),
-            StreamingFrameBody::HandshakeRequest(_)
-            | StreamingFrameBody::HandshakeReply(_)
-            | StreamingFrameBody::Request { .. }
-            | StreamingFrameBody::Reply { .. } => Err(TransportError::ExpectedSubscriptionEvent),
-        }
-    }
-
-    fn write_frame(&mut self, frame: Vec<u8>) -> Result<(), TransportError> {
-        LengthPrefixedCodec::default()
-            .write_body(&mut self.stream, &LengthPrefixedFrameBody::new(frame))?;
+    fn write_signal<T: Signalizable>(&mut self, value: &T) -> Result<(), TransportError> {
+        let signal = value
+            .signalize()
+            .map_err(|error| TransportError::Signal(error.to_string()))?;
+        LengthPrefixedCodec::default().write_body(
+            &mut self.stream,
+            &LengthPrefixedFrameBody::new(signal.bytes().to_vec()),
+        )?;
         self.stream.flush()?;
         Ok(())
     }
-
-    fn read_frame(&mut self) -> Result<Vec<u8>, TransportError> {
-        Ok(LengthPrefixedCodec::default()
+    fn read_signal<T>(&mut self) -> Result<T, TransportError>
+    where
+        Signal<T>: Restorable<T>,
+    {
+        let bytes = LengthPrefixedCodec::default()
             .read_body(&mut self.stream)?
-            .into_bytes())
+            .into_bytes();
+        Signal::<T>::from(bytes)
+            .restore()
+            .map_err(|error| TransportError::Signal(error.to_string()))
     }
 }

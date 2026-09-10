@@ -7,8 +7,8 @@ authoritative command and type definitions.
 
 ## Invocation and replies
 
-Invoke `spirit` with exactly one ordinary Input object and `meta-spirit` with
-exactly one owner Input object. The environment variables `SPIRIT_SOCKET` and
+Invoke `spirit` with exactly one ordinary Query object and `spirit-meta` with
+exactly one owner Query object. The environment variables `SPIRIT_SOCKET` and
 `SPIRIT_META_SOCKET` choose their respective Unix sockets. A bare atom is a
 complete object. Flags, path operands, zero operands, and multiple operands are
 rejected; neither help flags nor temporary `.nota` files are part of this
@@ -16,10 +16,10 @@ language.
 
 ```sh
 SPIRIT_SOCKET=/run/user/1000/spirit.sock spirit Version
-SPIRIT_META_SOCKET=/run/user/1000/meta-spirit.sock meta-spirit ObserveHead
+SPIRIT_META_SOCKET=/run/user/1000/meta-spirit.sock spirit-meta ObserveHead
 ```
 
-Successful requests print one typed NOTA reply. Rejection is likewise typed:
+Successful requests print one typed Datom reply. Rejection is likewise typed:
 ordinary requests can return `GuardianRejected`, `Rejected`, `AdvanceRefused`,
 or `Error`; owner configuration can return `Rejected`. Transport/decode errors
 go to stderr and return nonzero. Do not place provider prompts, provider
@@ -111,7 +111,4 @@ contents are operationally confidential even though core Spirit has no privacy
 field: keep owner sockets, store locations, credentials, session references,
 provider material, raw corpus bodies, and diagnostics closed or redacted.
 
-The daemon speaks binary Signal frames and requires its immutable binary
-configuration artifact. `spirit-write-configuration` and
-`spirit-migrate-store` are maintenance/service interfaces, not public grammar
-examples for `spirit` or `meta-spirit`.
+The zero-argument `spirit-nexus` daemon speaks binary Signal frames and reads persisted desired configuration from its stable Sema. `spirit-write-configuration` and `spirit-migrate-store` are offline maintenance tools, not public grammar examples for `spirit` or `spirit-meta`.

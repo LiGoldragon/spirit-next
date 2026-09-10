@@ -167,19 +167,19 @@ fn v13_projection_discards_retired_data_and_preserves_live_archive_and_rollback(
         .expect("query zero-certainty")
         .expect("zero-certainty row survives");
     assert_eq!(
-        zero.description.payload(),
+        zero.description,
         "zero certainty survives as an ordinary record"
     );
-    assert_eq!(zero.importance.payload(), &Magnitude::Low);
+    assert_eq!(zero.importance, Magnitude::Low);
     let formerly_private = store
         .entry_by_identifier("formerly-private")
         .expect("query formerly private")
         .expect("formerly private row survives");
     assert_eq!(
-        formerly_private.description.payload(),
+        formerly_private.description,
         "formerly private survives as an ordinary record"
     );
-    assert_eq!(formerly_private.importance.payload(), &Magnitude::High);
+    assert_eq!(formerly_private.importance, Magnitude::High);
 
     let migrations = store.migrations().expect("read v14 migration receipt");
     assert_eq!(migrations.len(), 1);
@@ -212,17 +212,14 @@ fn v13_projection_discards_retired_data_and_preserves_live_archive_and_rollback(
         .expect("enumerate projected archive");
     assert_eq!(archived.records().len(), 1);
     assert_eq!(
-        archived.records()[0].record_identifier.payload(),
+        archived.records()[0].record_identifier,
         "formerly-private-17"
     );
     assert_eq!(
-        archived.records()[0].entry.description.payload(),
+        archived.records()[0].entry.description,
         "archived retained substance"
     );
-    assert_eq!(
-        archived.records()[0].entry.importance.payload(),
-        &Magnitude::VeryHigh
-    );
+    assert_eq!(archived.records()[0].entry.importance, Magnitude::VeryHigh);
 
     let rollback = fixture.path().join("spirit.schema-13-rollback");
     assert_eq!(

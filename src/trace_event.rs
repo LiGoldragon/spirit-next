@@ -1,17 +1,15 @@
-#[cfg(feature = "testing-trace")]
-use signal_introspect::{
-    ComponentTraceEvent, IntrospectionTarget, TraceEventName, TraceLayer, TraceSequence,
-};
-#[cfg(feature = "testing-trace")]
-use signal_persona::EngineIdentifier;
-
 use crate::{
     engine::SignalObjectName,
     schema::{nexus::NexusObjectName, sema::SemaObjectName},
 };
+#[cfg(feature = "testing-trace")]
+use signal_introspect::{ComponentTraceEvent, IntrospectionTarget, TraceLayer};
 
-#[cfg_attr(feature = "nota-text", derive(nota::NotaDecode, nota::NotaEncode))]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "datom-cli",
+    derive(datom_codec::Datomizable, datom_codec::Compositional)
+)]
 pub enum ObjectName {
     Signal(SignalObjectName),
     Nexus(NexusObjectName),
@@ -19,14 +17,20 @@ pub enum ObjectName {
     Authorization(AuthorizationObjectName),
 }
 
-#[cfg_attr(feature = "nota-text", derive(nota::NotaDecode, nota::NotaEncode))]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "datom-cli",
+    derive(datom_codec::Datomizable, datom_codec::Compositional)
+)]
 pub enum AuthorizationObjectName {
     Observed,
 }
 
-#[cfg_attr(feature = "nota-text", derive(nota::NotaDecode, nota::NotaEncode))]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "datom-cli",
+    derive(datom_codec::Datomizable, datom_codec::Compositional)
+)]
 pub struct TraceEvent(pub ObjectName);
 
 impl ObjectName {
@@ -87,13 +91,13 @@ impl From<ObjectName> for TraceLayer {
 impl From<TraceEvent> for ComponentTraceEvent {
     fn from(event: TraceEvent) -> Self {
         let object_name = event.object_name();
-        ComponentTraceEvent::new(
-            EngineIdentifier::new(String::new()),
-            IntrospectionTarget::from(object_name),
-            TraceLayer::from(object_name),
-            TraceEventName::new(object_name.name()),
-            TraceSequence::new(0),
-        )
+        ComponentTraceEvent {
+            engine_identifier: String::new(),
+            introspection_target: IntrospectionTarget::from(object_name),
+            trace_layer: TraceLayer::from(object_name),
+            trace_event_name: object_name.name().to_owned(),
+            trace_sequence: 0,
+        }
     }
 }
 

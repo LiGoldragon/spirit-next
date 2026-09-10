@@ -5,13 +5,23 @@ use crate::{
 
 impl From<OriginRoute> for nexus::OriginRoute {
     fn from(origin_route: OriginRoute) -> Self {
-        Self::new(origin_route.payload())
+        Self::new(
+            origin_route
+                .payload()
+                .try_into()
+                .expect("origin route fits destination"),
+        )
     }
 }
 
 impl From<nexus::OriginRoute> for OriginRoute {
     fn from(origin_route: nexus::OriginRoute) -> Self {
-        Self::new(origin_route.payload())
+        Self::new(
+            origin_route
+                .payload()
+                .try_into()
+                .expect("origin route fits destination"),
+        )
     }
 }
 
@@ -23,13 +33,23 @@ impl From<nexus::OriginRoute> for sema::OriginRoute {
 
 impl From<OriginRoute> for sema::OriginRoute {
     fn from(origin_route: OriginRoute) -> Self {
-        Self::new(origin_route.payload())
+        Self::new(
+            origin_route
+                .payload()
+                .try_into()
+                .expect("origin route fits destination"),
+        )
     }
 }
 
 impl From<sema::OriginRoute> for OriginRoute {
     fn from(origin_route: sema::OriginRoute) -> Self {
-        Self::new(origin_route.payload())
+        Self::new(
+            origin_route
+                .payload()
+                .try_into()
+                .expect("origin route fits destination"),
+        )
     }
 }
 

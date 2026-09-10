@@ -15,6 +15,9 @@ pub enum StoreError {
         engine_error: sema_engine::Error,
     },
 
+    #[error("store filesystem operation failed: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("failed to encode record rkyv archive")]
     ArchiveEncode,
 
@@ -35,6 +38,9 @@ pub enum StoreError {
 
     #[error("criome operation authorization blocked: {0}")]
     CriomeAuthorization(String),
+
+    #[error("expected exactly one persisted Nexus configuration row, found {count}")]
+    ConfigurationInvariant { count: usize },
 }
 
 /// The spirit-specific remediation tail appended to a wrapped engine error's

@@ -1,3 +1,7 @@
+use crate::schema::nexus::Contentful as NexusContentful;
+use crate::schema::sema::Contentful as SemaContentful;
+use nexus::Configurable as _;
+use signal_spirit::{Query, Response};
 use std::collections::{HashMap, VecDeque};
 
 #[cfg(feature = "agent-guardian")]
@@ -5,6 +9,7 @@ use crate::guardian_journal::GuardianOperation;
 
 use crate::{
     MailLedger,
+    config::Configuration,
     schema::{
         meta_signal::ArchiveDatabaseTarget,
         nexus::{
@@ -17,37 +22,36 @@ use crate::{
             SemaEngine, WriteInput as SemaWriteInput, WriteOutput as SemaWriteOutput,
         },
         signal::{
-            ApplyRefusal, ApplyRefusalReason, Clarification, ClarificationReceipt,
-            ClarificationResolution, ClarificationResolutionReceipt, DatabaseMarker, Description,
-            Domain, Domains, Entry, ErrorMessage, ErrorReport, GuardianRejection, Importance,
-            Input, IntentClarified, IntentEvent, IntentRecorded, IntentSubscription,
-            IntentSuperseded, Justification, Kind, Magnitude, ObservedOperation,
-            ObservedOperations, ObservedRecords, ObserverFilter, ObserverRetraction,
-            ObserverSubscription, OperationKind, Output, Proposal, QuoteText, Reasoning,
-            RecordChange, RecordChangeReceipt, RecordCount, RecordIdentifier, RecordRequest,
-            RecordSet, Records, Replacements, Retirement, RetirementReceipt, SemaReceipt,
-            SignalRejection, StashHandle, StashedObservation, Statement, SubscriptionToken,
-            Supersession, SupersessionReceipt, Testimony, ValidationError, VerbatimQuote,
-            VersionReport, VersionText,
+            ApplyRefusal, ApplyRefusalReason, ClarificationReceipt, ClarificationRequest,
+            ClarificationResolution, ClarificationResolutionReceipt, ConfigurationReceipt,
+            ConfigurationRejection, ConfigurationRejectionReason, DatabaseMarker, Entry,
+            ErrorReport, GuardianRejection, IntentClarified, IntentEvent, IntentRecorded,
+            IntentSubscription, IntentSuperseded, Justification, Kind, Magnitude,
+            ObservedOperation, ObservedOperations, ObservedRecords, ObserverFilter,
+            ObserverRetraction, ObserverSubscription, OperationKind, Proposal, RecordChange,
+            RecordChangeReceipt, RecordIdentifier, RecordRequest, Records, Retirement,
+            RetirementReceipt, SemaReceipt, SignalRejection, StashHandle, StashedObservation,
+            Statement, SubscriptionToken, Supersession, SupersessionReceipt, ValidationError,
+            VerbatimQuote, VersionReport,
         },
     },
     store::{Store, StoreError},
 };
 
 #[cfg(feature = "agent-guardian")]
-use crate::schema::signal::{Explanation, GuardianRejectionReason};
+use crate::schema::signal::GuardianRejectionReason;
 
 #[cfg(feature = "testing-trace")]
 use crate::{ObjectName, TraceEvent, TraceLog, schema::nexus::NexusObjectName};
-use signal_frame::SubscriptionTokenInner;
+use signal_domain::{Domain, InformationDomain};
 use tokio::runtime::{Handle, RuntimeFlavor};
-use triad_runtime::{ContinuationExhausted, ContinuationLimit, SubscriptionTokenIssuer};
+use triad_runtime::{ContinuationExhausted, ContinuationLimit};
 
 /// The stash table — the in-memory recovery-handle store backing the Stash effect.
 ///
 /// The full-records observation gets archived under a freshly minted
 /// `StashHandle`; the reply carries the handle, count, and records together.
-/// A follow-up `Input::LookupStash(handle)` recovers the same records as a
+/// A follow-up `Query::LookupStash(handle)` recovers the same records as a
 /// normal `RecordsObserved` output.
 #[derive(Debug, Default)]
 pub struct StashTable {
@@ -55,7 +59,7 @@ pub struct StashTable {
     entries: HashMap<u64, StashEntry>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClassificationPolicy {
     fallback_domain: Domain,
     fallback_kind: Kind,
@@ -99,18 +103,18 @@ impl ObserverTapTable {
         self.taps.insert(
             token,
             ObserverTap {
-                filter,
+                filter: filter.clone(),
                 first_observed_operation: self.next_operation_revision(),
             },
         );
-        (token, filter, ObservedOperations::new(Vec::new()))
+        (token, filter, Vec::new())
     }
 
     /// Close an observer tap. Returns the tap's final filtered observations when
     /// the token was registered, and `None` when it was not. Afterwards, reclaims
     /// every prefix no remaining tap can consume.
     pub fn close(&mut self, token: SubscriptionToken) -> Option<ObservedOperations> {
-        let tap = self.taps.remove(token.payload())?;
+        let tap = self.taps.remove(&u64::try_from(token).ok()?)?;
         let observed_operations = self.observed_operations(&tap);
         self.reclaim_consumed_operations();
         Some(observed_operations)
@@ -129,15 +133,18 @@ impl ObserverTapTable {
         let retained_prefix_length =
             usize::try_from(tap.first_observed_operation - self.first_retained_operation)
                 .expect("observer tap cursor precedes the retained operation prefix");
-        ObservedOperations::new(
-            self.operation_log
-                .iter()
-                .skip(retained_prefix_length)
-                .filter(|operation| tap.filter.observes_operation(operation))
-                .cloned()
-                .map(ObservedOperation::new)
-                .collect(),
-        )
+        self.operation_log
+            .iter()
+            .skip(retained_prefix_length)
+            .filter(|_operation| {
+                matches!(
+                    tap.filter,
+                    ObserverFilter::All | ObserverFilter::OperationsOnly
+                )
+            })
+            .cloned()
+            .map(|operation_kind| ObservedOperation { operation_kind })
+            .collect()
     }
 
     fn reclaim_consumed_operations(&mut self) {
@@ -179,7 +186,7 @@ impl StashTable {
     pub fn put(&mut self, records: Records, database_marker: DatabaseMarker) -> StashResult {
         self.next_handle += 1;
         let handle = self.next_handle;
-        let record_count = records.payload().len() as u64;
+        let record_count = records.len() as u64;
         let observed_records = records.clone();
         self.entries.insert(
             handle,
@@ -189,8 +196,8 @@ impl StashTable {
             },
         );
         StashResult {
-            stash_handle: StashHandle::new(handle),
-            record_count: RecordCount::new(record_count),
+            stash_handle: i64::try_from(handle).expect("stash handle fits i64"),
+            record_count: i64::try_from(record_count).expect("record count fits i64"),
             database_marker,
             records: observed_records,
         }
@@ -201,7 +208,7 @@ impl StashTable {
     /// records remain retained in the daemon.
     pub fn take(&mut self, handle: &StashHandle) -> Option<(Records, DatabaseMarker)> {
         self.entries
-            .remove(handle.payload())
+            .remove(&u64::try_from(*handle).ok()?)
             .map(|entry| (entry.records, entry.database_marker))
     }
 
@@ -243,7 +250,7 @@ pub struct Nexus {
     operation_authorizer: crate::criome_gate::SpiritOperationAuthorizer,
     #[cfg(all(feature = "agent-guardian", feature = "criome-gate"))]
     operation_authorization_mode: signal_spirit::AuthorizationMode,
-    subscription_token_issuer: SubscriptionTokenIssuer,
+    next_subscription_token: i64,
     #[cfg(feature = "testing-trace")]
     trace_log: TraceLog,
 }
@@ -251,7 +258,7 @@ pub struct Nexus {
 impl Default for ClassificationPolicy {
     fn default() -> Self {
         Self {
-            fallback_domain: Domain::Information(crate::schema::signal::Information::Documentation),
+            fallback_domain: Domain::Information(InformationDomain::Documentation),
             fallback_kind: Kind::Clarification,
             fallback_magnitude: Magnitude::Minimum,
         }
@@ -260,20 +267,19 @@ impl Default for ClassificationPolicy {
 
 impl ClassificationPolicy {
     pub fn classify(&self, statement: Statement) -> RecordRequest {
-        let statement_text = statement.into_payload();
-        let description = statement_text.payload().clone();
+        let description = statement.statement_text;
         let justification = Justification {
-            testimony: Testimony::new(vec![VerbatimQuote::new(
-                QuoteText::new(description.clone()),
-                None,
-            )]),
-            reasoning: Reasoning::new(description.clone()),
+            testimony: vec![VerbatimQuote {
+                quote_text: description.clone(),
+                optional_antecedent: None,
+            }],
+            reasoning: description.clone(),
         };
         let entry = Entry {
-            domains: Domains::new(vec![self.fallback_domain.clone()]),
-            kind: self.fallback_kind,
-            description: Description::new(description),
-            importance: Importance::new(self.fallback_magnitude),
+            domains: vec![self.fallback_domain.clone()],
+            kind: self.fallback_kind.clone(),
+            description,
+            importance: self.fallback_magnitude.clone(),
         };
         RecordRequest {
             entry,
@@ -285,9 +291,42 @@ impl ClassificationPolicy {
 impl CommandSemaWrite {
     fn into_sema_write_input(self) -> SemaWriteInput {
         match self {
-            Self::Record(record) => SemaWriteInput::record(record.into_payload()),
-            Self::BumpImportance(change) => SemaWriteInput::bump_importance(change.into_payload()),
-            Self::ChangeRecord(change) => SemaWriteInput::change_record(change.into_payload()),
+            Self::Record(record) => SemaWriteInput::record(record.content()),
+            Self::BumpImportance(change) => SemaWriteInput::bump_importance(change.content()),
+            Self::ChangeRecord(change) => SemaWriteInput::change_record(change.content()),
+        }
+    }
+}
+
+trait OperationKinded {
+    fn operation_kind(&self) -> OperationKind;
+}
+
+impl OperationKinded for Query {
+    fn operation_kind(&self) -> OperationKind {
+        match self {
+            Query::Configure(_) => OperationKind::Configure,
+            Query::State(_) => OperationKind::State,
+            Query::Record(_) => OperationKind::Record,
+            Query::Propose(_) => OperationKind::Propose,
+            Query::Clarify(_) => OperationKind::Clarify,
+            Query::Supersede(_) => OperationKind::Supersede,
+            Query::Retire(_) => OperationKind::Retire,
+            Query::ResolveClarification(_) => OperationKind::ResolveClarification,
+            Query::Observe(_) => OperationKind::Observe,
+            Query::Intent(_) => OperationKind::Intent,
+            Query::TextSearch(_) => OperationKind::TextSearch,
+            Query::Lookup(_) => OperationKind::Lookup,
+            Query::Count(_) => OperationKind::Count,
+            Query::BumpImportance(_) => OperationKind::BumpImportance,
+            Query::ChangeRecord(_) => OperationKind::ChangeRecord,
+            Query::LookupStash(_) => OperationKind::LookupStash,
+            Query::Tap(_) => OperationKind::Tap,
+            Query::Untap(_) => OperationKind::Untap,
+            Query::ApplyAuthorizedRecord(_) => OperationKind::ApplyAuthorizedRecord,
+            Query::SubscribeIntent(_) => OperationKind::SubscribeIntent,
+            Query::Version => OperationKind::Version,
+            Query::Marker => OperationKind::Marker,
         }
     }
 }
@@ -315,7 +354,7 @@ impl Nexus {
                 operation_authorizer: crate::criome_gate::SpiritOperationAuthorizer::new(),
                 #[cfg(all(feature = "agent-guardian", feature = "criome-gate"))]
                 operation_authorization_mode: signal_spirit::AuthorizationMode::Gating,
-                subscription_token_issuer: SubscriptionTokenIssuer::default(),
+                next_subscription_token: 0,
             }
         }
     }
@@ -336,7 +375,7 @@ impl Nexus {
             operation_authorizer: crate::criome_gate::SpiritOperationAuthorizer::new(),
             #[cfg(all(feature = "agent-guardian", feature = "criome-gate"))]
             operation_authorization_mode: signal_spirit::AuthorizationMode::Gating,
-            subscription_token_issuer: SubscriptionTokenIssuer::default(),
+            next_subscription_token: 0,
             trace_log,
         }
     }
@@ -415,9 +454,9 @@ impl Nexus {
     ) -> Result<Option<IntentEvent>, StoreError> {
         Ok(self
             .store
-            .entry_by_identifier(record_identifier.payload())?
+            .entry_by_identifier(record_identifier)?
             .map(|entry| {
-                IntentEvent::intent_recorded(IntentRecorded {
+                IntentEvent::IntentRecorded(IntentRecorded {
                     entry,
                     record_identifier: record_identifier.clone(),
                 })
@@ -430,10 +469,10 @@ impl Nexus {
     ) -> Result<Option<IntentEvent>, StoreError> {
         Ok(self
             .store
-            .entry_by_identifier(receipt.payload().payload())?
+            .entry_by_identifier(&receipt.record_identifier)?
             .map(|entry| {
-                IntentEvent::intent_clarified(IntentClarified {
-                    record_identifier: receipt.payload().clone(),
+                IntentEvent::IntentClarified(IntentClarified {
+                    record_identifier: receipt.record_identifier.clone(),
                     entry,
                 })
             }))
@@ -448,20 +487,22 @@ impl Nexus {
         // one rather than collapsing to None (under single-flight every id
         // resolves; this only hardens against a future concurrency relaxation).
         let mut replacements = Vec::new();
-        for identifier in receipt.record_identifiers.payload() {
-            if let Some(entry) = self.store.entry_by_identifier(identifier.payload())? {
+        for identifier in &receipt.record_identifiers {
+            if let Some(entry) = self.store.entry_by_identifier(identifier)? {
                 replacements.push(entry);
             }
         }
-        Ok(Some(IntentEvent::intent_superseded(IntentSuperseded {
+        Ok(Some(IntentEvent::IntentSuperseded(IntentSuperseded {
             retired_identifiers: receipt.retired_identifiers.clone(),
-            replacements: Replacements::new(replacements),
+            replacements,
             record_identifiers: receipt.record_identifiers.clone(),
         })))
     }
 
     pub fn intent_retired_event(&self, receipt: &RetirementReceipt) -> IntentEvent {
-        IntentEvent::intent_retired(receipt.payload().clone())
+        IntentEvent::IntentRetired(signal_spirit::IntentRetired {
+            record_identifier: receipt.record_identifier.clone(),
+        })
     }
 
     /// Apply a Nexus-local effect, producing the matching effect result
@@ -469,13 +510,11 @@ impl Nexus {
     async fn apply_effect(&mut self, command: NexusEffectCommand) -> NexusEffectResult {
         match command {
             NexusEffectCommand::ClassifyState(statement) => {
-                let record_request = self
-                    .classification_policy
-                    .classify(statement.into_payload());
+                let record_request = self.classification_policy.classify(statement.content());
                 NexusEffectResult::state_classified(record_request)
             }
             NexusEffectCommand::GuardRecord(record) => {
-                match self.guard_record(record.into_payload()).await {
+                match self.guard_record(record.content()).await {
                     Ok(Ok(receipt)) => {
                         #[cfg(feature = "testing-trace")]
                         self.trace_direct_sema_write();
@@ -486,7 +525,7 @@ impl Nexus {
                 }
             }
             NexusEffectCommand::Propose(propose) => {
-                match self.guard_propose(propose.into_payload()).await {
+                match self.guard_propose(propose.content()).await {
                     Ok(Ok(receipt)) => {
                         #[cfg(feature = "testing-trace")]
                         self.trace_direct_sema_write();
@@ -497,7 +536,7 @@ impl Nexus {
                 }
             }
             NexusEffectCommand::Clarify(clarify) => {
-                match self.guard_clarify(clarify.into_payload()).await {
+                match self.guard_clarify(clarify.content()).await {
                     Ok(Ok(Some(receipt))) => {
                         #[cfg(feature = "testing-trace")]
                         self.trace_direct_sema_write();
@@ -509,10 +548,7 @@ impl Nexus {
                 }
             }
             NexusEffectCommand::ResolveClarification(resolution) => {
-                match self
-                    .guard_resolve_clarification(resolution.into_payload())
-                    .await
-                {
+                match self.guard_resolve_clarification(resolution.content()).await {
                     Ok(Ok(Some(receipt))) => {
                         #[cfg(feature = "testing-trace")]
                         self.trace_direct_sema_write();
@@ -526,7 +562,7 @@ impl Nexus {
                 }
             }
             NexusEffectCommand::Supersede(supersede) => {
-                match self.guard_supersede(supersede.into_payload()).await {
+                match self.guard_supersede(supersede.content()).await {
                     Ok(Ok(Some(receipt))) => {
                         #[cfg(feature = "testing-trace")]
                         self.trace_direct_sema_write();
@@ -537,20 +573,18 @@ impl Nexus {
                     Err(error) => self.operation_failed(error.to_string()),
                 }
             }
-            NexusEffectCommand::Retire(retire) => {
-                match self.guard_retire(retire.into_payload()).await {
-                    Ok(Ok(Some(receipt))) => {
-                        #[cfg(feature = "testing-trace")]
-                        self.trace_direct_sema_write();
-                        NexusEffectResult::retired(receipt)
-                    }
-                    Ok(Ok(None)) => self.operation_failed("record not found"),
-                    Ok(Err(rejection)) => NexusEffectResult::guardian_rejected(rejection),
-                    Err(error) => self.operation_failed(error.to_string()),
+            NexusEffectCommand::Retire(retire) => match self.guard_retire(retire.content()).await {
+                Ok(Ok(Some(receipt))) => {
+                    #[cfg(feature = "testing-trace")]
+                    self.trace_direct_sema_write();
+                    NexusEffectResult::retired(receipt)
                 }
-            }
+                Ok(Ok(None)) => self.operation_failed("record not found"),
+                Ok(Err(rejection)) => NexusEffectResult::guardian_rejected(rejection),
+                Err(error) => self.operation_failed(error.to_string()),
+            },
             NexusEffectCommand::GuardChangeRecord(change) => {
-                match self.guard_change_record(change.into_payload()).await {
+                match self.guard_change_record(change.content()).await {
                     Ok(Ok(Some(receipt))) => {
                         #[cfg(feature = "testing-trace")]
                         self.trace_direct_sema_write();
@@ -565,33 +599,36 @@ impl Nexus {
                 let StashRequest {
                     records,
                     database_marker,
-                } = stash.into_payload();
+                } = stash.content();
                 let result = self.stash_table.put(records, database_marker);
                 NexusEffectResult::stashed(result)
             }
             NexusEffectCommand::OpenIntentSubscription(_query) => {
-                let token: SubscriptionTokenInner = self.subscription_token_issuer.issue();
-                NexusEffectResult::intent_subscription_opened(IntentSubscription::new(
-                    SubscriptionToken::new(token.value()),
-                ))
+                self.next_subscription_token = self
+                    .next_subscription_token
+                    .checked_add(1)
+                    .expect("subscription token range exhausted");
+                NexusEffectResult::intent_subscription_opened(IntentSubscription {
+                    subscription_token: self.next_subscription_token,
+                })
             }
             NexusEffectCommand::OpenObserverTap(filter) => {
                 let (token, observer_filter, observed_operations) =
-                    self.observer_tap_table.open(filter.into_payload());
+                    self.observer_tap_table.open(filter.content());
                 NexusEffectResult::observer_tap_opened(ObserverSubscription {
-                    subscription_token: SubscriptionToken::new(token),
+                    subscription_token: token as i64,
                     observer_filter,
                     observed_operations,
                 })
             }
             NexusEffectCommand::CloseObserverTap(token) => {
-                let subscription_token = token.into_payload();
+                let subscription_token = token;
                 let observed_operations = self
                     .observer_tap_table
-                    .close(subscription_token.clone())
-                    .unwrap_or_else(|| ObservedOperations::new(Vec::new()));
+                    .close(subscription_token.clone().content())
+                    .unwrap_or_default();
                 NexusEffectResult::observer_tap_closed(ObserverRetraction {
-                    subscription_token,
+                    subscription_token: subscription_token.content(),
                     observed_operations,
                 })
             }
@@ -649,7 +686,7 @@ impl Nexus {
     #[cfg(not(feature = "agent-guardian"))]
     async fn guard_clarify(
         &mut self,
-        clarification: Clarification,
+        clarification: ClarificationRequest,
     ) -> Result<Result<Option<ClarificationReceipt>, GuardianRejection>, StoreError> {
         Ok(Ok(self.store.clarify(clarification)?))
     }
@@ -657,7 +694,7 @@ impl Nexus {
     #[cfg(feature = "agent-guardian")]
     async fn guard_clarify(
         &mut self,
-        clarification: Clarification,
+        clarification: ClarificationRequest,
     ) -> Result<Result<Option<ClarificationReceipt>, GuardianRejection>, StoreError> {
         let operation = GuardianOperation::clarify(clarification.clone());
         let authorization_operation = operation.clone();
@@ -774,9 +811,7 @@ impl Nexus {
             let database_marker = self.store.database_marker();
             let verdict = nexus_schema::GuardianVerdict::reject(nexus_schema::Reject {
                 guardian_rejection_reason: GuardianRejectionReason::HarnessUnavailable,
-                explanation: Explanation::new(
-                    "guardian is required but no guardian agent is configured",
-                ),
+                explanation: "guardian is required but no guardian agent is configured".into(),
             });
             self.store.record_guardian_decision(
                 crate::guardian_journal::GuardianDecision::record(
@@ -789,9 +824,7 @@ impl Nexus {
             return Ok(Some(GuardianRejection {
                 guardian_rejection_reason: GuardianRejectionReason::HarnessUnavailable,
                 record_set: records,
-                explanation: Explanation::new(
-                    "guardian is required but no guardian agent is configured",
-                ),
+                explanation: "guardian is required but no guardian agent is configured".into(),
             }));
         };
         let records = self.store.guardian_records_for_operation(&operation)?;
@@ -819,7 +852,9 @@ impl Nexus {
     }
 
     fn operation_failed(&self, message: impl Into<String>) -> NexusEffectResult {
-        NexusEffectResult::operation_failed(ErrorReport::new(ErrorMessage::new(message.into())))
+        NexusEffectResult::operation_failed(ErrorReport {
+            error_message: message.into(),
+        })
     }
 
     #[cfg(all(feature = "agent-guardian", feature = "criome-gate"))]
@@ -830,7 +865,7 @@ impl Nexus {
         let context = operation.authorization_context(self.operation_authorizer.process_key());
         match self
             .operation_authorizer
-            .authorize(context, self.operation_authorization_mode)
+            .authorize(context, self.operation_authorization_mode.clone())
             .await
             .map_err(|error| StoreError::CriomeAuthorization(error.to_string()))?
         {
@@ -947,12 +982,14 @@ impl Nexus {
         }
     }
 
-    fn budget_exhausted_reply(&self, exhausted: ContinuationExhausted) -> Output {
-        Output::error(ErrorReport::new(ErrorMessage::new(format!(
-            "nexus continuation budget exhausted after {} steps (limit {})",
-            exhausted.completed_step_count(),
-            exhausted.limit().count()
-        ))))
+    fn budget_exhausted_reply(&self, exhausted: ContinuationExhausted) -> Response {
+        Response::Error(ErrorReport {
+            error_message: format!(
+                "nexus continuation budget exhausted after {} steps (limit {})",
+                exhausted.completed_step_count(),
+                exhausted.limit().count()
+            ),
+        })
     }
 }
 
@@ -1004,7 +1041,7 @@ impl NexusEngine for Nexus {
         self.apply_effect_operation(input).await
     }
 
-    fn budget_exhausted_reply(&self, exhausted: ContinuationExhausted) -> Output {
+    fn budget_exhausted_reply(&self, exhausted: ContinuationExhausted) -> Response {
         Nexus::budget_exhausted_reply(self, exhausted)
     }
 
@@ -1026,7 +1063,7 @@ impl Nexus {
     /// The Observe-with-Stash flow lives here: a SemaRead completion
     /// with non-empty results becomes a `CommandEffect(Stash(...))`
     /// recursion (NOT a direct Signal reply), and the EffectCompleted
-    /// (Stashed) feedback becomes `Output::RecordsStashed`, carrying
+    /// (Stashed) feedback becomes `Response::RecordsStashed`, carrying
     /// both the stash handle and the observed records.
     /// State classification also lives here as a schema-declared
     /// `CommandEffect(ClassifyState)` followed by
@@ -1048,79 +1085,113 @@ impl Nexus {
         }
     }
 
-    fn decide_signal_arrival(&mut self, input: Input) -> NexusAction {
+    /// Apply ordinary Configure only while the persisted truthful meta marker
+    /// remains unset. This updates desired configuration for a later restart;
+    /// it never rebinds this process or changes its stable Sema location.
+    fn ordinary_configure(
+        &self,
+        configuration: signal_spirit::SpiritNexusConfiguration,
+    ) -> Response {
+        let Ok(mut state) = self.store.nexus_configuration_state() else {
+            return Response::ConfigurationRefused(ConfigurationRejection {
+                configuration_rejection_reason: ConfigurationRejectionReason::InvalidConfiguration,
+            });
+        };
+        if state.ordinary_configure_if_unset(configuration).is_err() {
+            return Response::ConfigurationRefused(ConfigurationRejection {
+                configuration_rejection_reason: ConfigurationRejectionReason::MetaConfigureOccurred,
+            });
+        }
+        if Configuration::validate_nexus_configuration(state.desired_configuration()).is_err()
+            || self
+                .store
+                .replace_nexus_configuration(state.clone())
+                .is_err()
+        {
+            return Response::ConfigurationRefused(ConfigurationRejection {
+                configuration_rejection_reason: ConfigurationRejectionReason::InvalidConfiguration,
+            });
+        }
+        Response::ConfigurationAccepted(ConfigurationReceipt {
+            spirit_nexus_configuration: state.desired_configuration().clone(),
+            meta_configure_done: state.meta_configure_occurred(),
+        })
+    }
+
+    fn decide_signal_arrival(&mut self, input: Query) -> NexusAction {
         // Record every admitted operation in the observer log so a later
         // `Tap(ObserverFilter)` sees the operations observed so far. This is the
         // recording half of the ported `Tap`/`Untap` observer surface.
         self.observer_tap_table
-            .observe_operation(OperationKind::from_input(&input));
+            .observe_operation(input.operation_kind());
         match input {
-            Input::State(statement) => NexusAction::command_effect(
-                NexusEffectCommand::classify_state(statement.into_payload()),
-            ),
-            Input::Record(record) => {
-                NexusAction::command_effect(NexusEffectCommand::guard_record(record.into_payload()))
+            Query::Configure(configuration) => {
+                NexusAction::reply_to_signal(self.ordinary_configure(configuration))
             }
-            Input::Propose(propose) => {
-                NexusAction::command_effect(NexusEffectCommand::propose(propose.into_payload()))
+            Query::State(statement) => {
+                NexusAction::command_effect(NexusEffectCommand::classify_state(statement))
             }
-            Input::Clarify(clarify) => {
-                NexusAction::command_effect(NexusEffectCommand::clarify(clarify.into_payload()))
+            Query::Record(record) => {
+                NexusAction::command_effect(NexusEffectCommand::guard_record(record))
             }
-            Input::ResolveClarification(resolution) => NexusAction::command_effect(
-                NexusEffectCommand::resolve_clarification(resolution.into_payload()),
-            ),
-            Input::Supersede(supersede) => {
-                NexusAction::command_effect(NexusEffectCommand::supersede(supersede.into_payload()))
+            Query::Propose(propose) => {
+                NexusAction::command_effect(NexusEffectCommand::propose(propose))
             }
-            Input::Retire(retire) => {
-                NexusAction::command_effect(NexusEffectCommand::retire(retire.into_payload()))
+            Query::Clarify(clarify) => {
+                NexusAction::command_effect(NexusEffectCommand::clarify(clarify))
             }
-            Input::Observe(observe) => {
-                NexusAction::command_sema_read(SemaReadInput::observe(observe.into_payload()))
+            Query::ResolveClarification(resolution) => {
+                NexusAction::command_effect(NexusEffectCommand::resolve_clarification(resolution))
             }
-            Input::Intent(intent) => {
-                NexusAction::command_sema_read(SemaReadInput::intent(intent.into_payload()))
+            Query::Supersede(supersede) => {
+                NexusAction::command_effect(NexusEffectCommand::supersede(supersede))
             }
-            Input::TextSearch(search) => {
-                NexusAction::command_sema_read(SemaReadInput::text_search(search.into_payload()))
+            Query::Retire(retire) => {
+                NexusAction::command_effect(NexusEffectCommand::retire(retire))
             }
-            Input::Lookup(lookup) => {
-                NexusAction::command_sema_read(SemaReadInput::lookup(lookup.into_payload()))
+            Query::Observe(observe) => {
+                NexusAction::command_sema_read(SemaReadInput::observe(Query::Observe(observe)))
             }
-            Input::Count(count) => {
-                NexusAction::command_sema_read(SemaReadInput::count(count.into_payload()))
+            Query::Intent(intent) => NexusAction::command_sema_read(SemaReadInput::intent(intent)),
+            Query::TextSearch(search) => {
+                NexusAction::command_sema_read(SemaReadInput::text_search(search))
             }
-            Input::BumpImportance(change) => NexusAction::command_sema_write(
-                CommandSemaWrite::bump_importance(change.into_payload()),
-            ),
-            Input::ChangeRecord(change) => NexusAction::command_effect(
-                NexusEffectCommand::guard_change_record(change.into_payload()),
-            ),
-            Input::LookupStash(handle) => match self.stash_table.take(handle.payload()) {
+            Query::Lookup(lookup) => NexusAction::command_sema_read(SemaReadInput::lookup(lookup)),
+            Query::Count(count) => {
+                NexusAction::command_sema_read(SemaReadInput::count(Query::Count(count)))
+            }
+            Query::BumpImportance(change) => {
+                NexusAction::command_sema_write(CommandSemaWrite::bump_importance(change))
+            }
+            Query::ChangeRecord(change) => {
+                NexusAction::command_effect(NexusEffectCommand::guard_change_record(change))
+            }
+            Query::LookupStash(handle) => match self.stash_table.take(&handle) {
                 Some((records, _database_marker)) => NexusAction::reply_to_signal(
-                    Output::records_observed(crate::schema::signal::ObservedRecords::new(
-                        crate::schema::signal::RecordSet::new(records.into_payload()),
-                    )),
+                    Response::RecordsObserved(crate::schema::signal::ObservedRecords {
+                        record_set: records,
+                    }),
                 ),
-                None => NexusAction::reply_to_signal(Output::rejected(SignalRejection::new(
-                    ValidationError::StashHandleNotFound,
-                ))),
+                None => NexusAction::reply_to_signal(Response::Rejected(SignalRejection {
+                    validation_error: ValidationError::StashHandleNotFound,
+                })),
             },
-            Input::Tap(filter) => NexusAction::command_effect(
-                NexusEffectCommand::open_observer_tap(filter.into_payload()),
+            Query::Tap(filter) => {
+                NexusAction::command_effect(NexusEffectCommand::open_observer_tap(filter))
+            }
+            Query::Untap(token) => {
+                NexusAction::command_effect(NexusEffectCommand::close_observer_tap(token))
+            }
+            Query::SubscribeIntent(query) => NexusAction::command_effect(
+                NexusEffectCommand::open_intent_subscription(Query::SubscribeIntent(query)),
             ),
-            Input::Untap(token) => NexusAction::command_effect(
-                NexusEffectCommand::close_observer_tap(token.into_payload()),
-            ),
-            Input::SubscribeIntent(query) => NexusAction::command_effect(
-                NexusEffectCommand::open_intent_subscription(query.into_payload()),
-            ),
-            Input::Version => NexusAction::reply_to_signal(Output::version_reported(
-                VersionReport::new(VersionText::new(env!("CARGO_PKG_VERSION"))),
-            )),
-            Input::Marker => {
-                NexusAction::reply_to_signal(Output::marker_reported(self.database_marker()))
+            Query::Version => {
+                NexusAction::reply_to_signal(Response::VersionReported(VersionReport {
+                    version_text: env!("CARGO_PKG_VERSION").into(),
+                }))
+            }
+            Query::Marker => {
+                NexusAction::reply_to_signal(Response::MarkerReported(self.database_marker()))
             }
             // The authorized-apply ingress stays parked until the §4
             // propagation slice reactivates it in batch form
@@ -1130,25 +1201,27 @@ impl Nexus {
             // apply on the working socket; the contract retains the variant,
             // so the daemon answers it fail-closed — no criome round-trip,
             // no store write.
-            Input::ApplyAuthorizedRecord(_) => NexusAction::reply_to_signal(Output::apply_refused(
-                ApplyRefusal::new(ApplyRefusalReason::AuthorizationUnavailable),
-            )),
+            Query::ApplyAuthorizedRecord(_) => {
+                NexusAction::reply_to_signal(Response::ApplyRefused(ApplyRefusal {
+                    apply_refusal_reason: ApplyRefusalReason::AuthorizationUnavailable,
+                }))
+            }
         }
     }
 
     fn decide_sema_write_completion(&self, output: SemaWriteOutput) -> NexusAction {
         match output {
             SemaWriteOutput::Recorded(receipt) => NexusAction::reply_to_signal(
-                Output::record_accepted(receipt.into_payload().record_identifier),
+                Response::RecordAccepted(receipt.content().record_identifier),
             ),
             SemaWriteOutput::ImportanceBumped(receipt) => {
-                NexusAction::reply_to_signal(Output::importance_bumped(receipt.into_payload()))
+                NexusAction::reply_to_signal(Response::ImportanceBumped(receipt.content()))
             }
             SemaWriteOutput::RecordChanged(receipt) => {
-                NexusAction::reply_to_signal(Output::record_changed(receipt.into_payload()))
+                NexusAction::reply_to_signal(Response::RecordChanged(receipt.content()))
             }
             SemaWriteOutput::Missed(report) => {
-                NexusAction::reply_to_signal(Output::error(report.into_payload()))
+                NexusAction::reply_to_signal(Response::Error(report.content()))
             }
         }
     }
@@ -1158,27 +1231,26 @@ impl Nexus {
             SemaReadOutput::Observed(observed) => {
                 // Observe recurses through Stash so the reply carries
                 // both a recovery handle and the record set.
-                let observed = observed.into_payload();
-                let records = Records::new(observed.into_payload().into_payload());
+                let records = observed.content().record_set;
                 NexusAction::command_effect(NexusEffectCommand::stash(StashRequest {
                     records,
                     database_marker: self.database_marker(),
                 }))
             }
             SemaReadOutput::IntentResults(observed) => {
-                NexusAction::reply_to_signal(Output::records_observed(observed.into_payload()))
+                NexusAction::reply_to_signal(Response::RecordsObserved(observed.content()))
             }
             SemaReadOutput::TextSearchResults(observed) => {
-                NexusAction::reply_to_signal(Output::records_observed(observed.into_payload()))
+                NexusAction::reply_to_signal(Response::RecordsObserved(observed.content()))
             }
             SemaReadOutput::Found(record) => {
-                NexusAction::reply_to_signal(Output::record_found(record.into_payload()))
+                NexusAction::reply_to_signal(Response::RecordFound(record.content()))
             }
             SemaReadOutput::Counted(counted) => {
-                NexusAction::reply_to_signal(Output::records_counted(counted.into_payload()))
+                NexusAction::reply_to_signal(Response::RecordsCounted(counted.content()))
             }
             SemaReadOutput::Missed(report) => {
-                NexusAction::reply_to_signal(Output::error(report.into_payload()))
+                NexusAction::reply_to_signal(Response::Error(report.content()))
             }
         }
     }
@@ -1188,43 +1260,41 @@ impl Nexus {
             NexusEffectResult::StateClassified(record) => {
                 #[cfg(feature = "agent-guardian")]
                 {
-                    NexusAction::command_effect(NexusEffectCommand::guard_record(
-                        record.into_payload(),
-                    ))
+                    NexusAction::command_effect(NexusEffectCommand::guard_record(record.content()))
                 }
                 #[cfg(not(feature = "agent-guardian"))]
                 {
                     NexusAction::command_sema_write(CommandSemaWrite::record(
-                        record.into_payload().entry,
+                        record.content().entry,
                     ))
                 }
             }
             NexusEffectResult::Recorded(receipt) => NexusAction::reply_to_signal(
-                Output::record_accepted(receipt.into_payload().record_identifier),
+                Response::RecordAccepted(receipt.content().record_identifier),
             ),
-            NexusEffectResult::Proposed(receipt) => NexusAction::reply_to_signal(Output::proposed(
-                receipt.into_payload().record_identifier,
-            )),
+            NexusEffectResult::Proposed(receipt) => NexusAction::reply_to_signal(
+                Response::Proposed(receipt.content().record_identifier),
+            ),
             NexusEffectResult::Clarified(receipt) => {
-                NexusAction::reply_to_signal(Output::clarified(receipt.into_payload()))
+                NexusAction::reply_to_signal(Response::Clarified(receipt.content()))
             }
             NexusEffectResult::ClarificationResolved(receipt) => {
-                NexusAction::reply_to_signal(Output::clarification_resolved(receipt.into_payload()))
+                NexusAction::reply_to_signal(Response::ClarificationResolved(receipt.content()))
             }
             NexusEffectResult::Superseded(receipt) => {
-                NexusAction::reply_to_signal(Output::superseded(receipt.into_payload()))
+                NexusAction::reply_to_signal(Response::Superseded(receipt.content()))
             }
             NexusEffectResult::Retired(receipt) => {
-                NexusAction::reply_to_signal(Output::retired(receipt.into_payload()))
+                NexusAction::reply_to_signal(Response::Retired(receipt.content()))
             }
             NexusEffectResult::RecordChanged(receipt) => {
-                NexusAction::reply_to_signal(Output::record_changed(receipt.into_payload()))
+                NexusAction::reply_to_signal(Response::RecordChanged(receipt.content()))
             }
             NexusEffectResult::OperationFailed(report) => {
-                NexusAction::reply_to_signal(Output::error(report.into_payload()))
+                NexusAction::reply_to_signal(Response::Error(report.content()))
             }
             NexusEffectResult::GuardianRejected(rejection) => {
-                NexusAction::reply_to_signal(Output::guardian_rejected(rejection.into_payload()))
+                NexusAction::reply_to_signal(Response::GuardianRejected(rejection.content()))
             }
             NexusEffectResult::Stashed(stashed) => {
                 let StashResult {
@@ -1232,24 +1302,24 @@ impl Nexus {
                     record_count,
                     database_marker: _database_marker,
                     records,
-                } = stashed.into_payload();
-                NexusAction::reply_to_signal(Output::records_stashed(StashedObservation {
+                } = stashed.content();
+                NexusAction::reply_to_signal(Response::RecordsStashed(StashedObservation {
                     stash_handle,
                     record_count,
-                    observed_records: ObservedRecords::new(RecordSet::new(records.into_payload())),
+                    observed_records: ObservedRecords {
+                        record_set: records,
+                    },
                 }))
             }
             NexusEffectResult::IntentSubscriptionOpened(subscription) => {
-                NexusAction::reply_to_signal(Output::subscription_started(
-                    subscription.into_payload(),
-                ))
+                NexusAction::reply_to_signal(Response::SubscriptionStarted(subscription.content()))
             }
-            NexusEffectResult::ObserverTapOpened(subscription) => NexusAction::reply_to_signal(
-                Output::observation_tapped(subscription.into_payload()),
-            ),
-            NexusEffectResult::ObserverTapClosed(retraction) => NexusAction::reply_to_signal(
-                Output::observation_untapped(retraction.into_payload()),
-            ),
+            NexusEffectResult::ObserverTapOpened(subscription) => {
+                NexusAction::reply_to_signal(Response::ObservationTapped(subscription.content()))
+            }
+            NexusEffectResult::ObserverTapClosed(retraction) => {
+                NexusAction::reply_to_signal(Response::ObservationUntapped(retraction.content()))
+            }
         }
     }
 }

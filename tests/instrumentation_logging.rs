@@ -6,9 +6,8 @@ use spirit::{
         nexus::NexusObjectName,
         sema::SemaObjectName,
         signal::{
-            Description, DomainMatch, Domains, Entry, ImportanceSelection, Input, Justification,
-            Kind, Magnitude, Output, Query, QuoteText, Reasoning, RecordRequest, SelectedKind,
-            SignalRejection, Testimony, ValidationError, VerbatimQuote,
+            DomainMatch, Entry, ImportanceSelection, Justification, Kind, Magnitude, Query,
+            RecordRequest, Response, SignalRejection, ValidationError, VerbatimQuote,
         },
     },
 };
@@ -37,21 +36,21 @@ fn entry(description: &str) -> Entry {
     Entry {
         domains: domain_fixtures::domains(&["trace"]),
         kind: Kind::Decision,
-        description: Description::new(description),
-        importance: Magnitude::Minimum.into(),
+        description: description.to_owned(),
+        importance: Magnitude::Minimum,
     }
 }
 
 fn record_request(entry: Entry) -> RecordRequest {
-    let statement = entry.description.payload().clone();
+    let statement = entry.description.clone();
     RecordRequest {
         entry,
         justification: Justification {
-            testimony: Testimony::new(vec![VerbatimQuote::new(
-                QuoteText::new(statement.clone()),
-                None,
-            )]),
-            reasoning: Reasoning::new(statement),
+            testimony: vec![VerbatimQuote {
+                quote_text: statement.clone(),
+                optional_antecedent: None,
+            }],
+            reasoning: statement,
         },
     }
 }
@@ -62,25 +61,25 @@ fn testing_trace_records_real_signal_nexus_and_sema_activations() {
     let trace_log = TraceLog::recording();
     let mut engine = sema.engine_with_trace(trace_log.clone());
 
-    let recorded = engine.handle(Input::record(record_request(entry("trace witness"))));
+    let recorded = engine.handle(Query::Record(record_request(entry("trace witness"))));
     match recorded.root() {
-        Output::RecordAccepted(receipt) => assert!(!receipt.payload().payload().is_empty()),
+        Response::RecordAccepted(receipt) => assert!(!receipt.is_empty()),
         other => panic!("expected RecordAccepted, got {other:?}"),
     };
 
-    let observed = engine.handle(Input::observe(Query {
-        domain_match: DomainMatch::full(domain_fixtures::scopes(&["trace"])),
+    let observed = engine.handle(Query::Observe(spirit::schema::signal::Selection {
+        domain_match: DomainMatch::Full(domain_fixtures::scopes(&["trace"])),
         keyword_match: spirit::schema::signal::KeywordMatch::Any,
         text_match: spirit::schema::signal::TextMatch::Any,
-        selected_kind: SelectedKind::new(Some(Kind::Decision)),
-        importance_selection: ImportanceSelection::default_observation_importance(),
+        selected_kind: Some(Kind::Decision),
+        importance_selection: ImportanceSelection::Any,
     }));
     // Observe flows through Stash and returns both records and a recovery
     // handle. The trace below witnesses the recursive Nexus loop:
     // each NexusEntered/NexusDecided pair is one decision step. Observe needs
     // three steps: command SEMA read, command stash effect, reply to Signal.
     let record_marker = match observed.root() {
-        Output::RecordsStashed(_) => engine.database_marker(),
+        Response::RecordsStashed(_) => engine.database_marker(),
         other => panic!("expected RecordsStashed, got {other:?}"),
     };
 
@@ -137,18 +136,17 @@ fn testing_trace_records_real_signal_nexus_and_sema_activations() {
     let decoded = rkyv::from_bytes::<TraceEvent, rkyv::rancor::Error>(&archive)
         .expect("trace event decodes from rkyv");
     assert_eq!(decoded, events[4]);
-    #[cfg(feature = "nota-text")]
+    #[cfg(feature = "datom-cli")]
     {
         let rendered = events[4].to_string();
-        assert_eq!(rendered, "(Sema WriteApplied)");
+        assert_eq!(rendered, "{ Sema.WriteApplied }");
         let parsed = rendered
             .parse::<TraceEvent>()
-            .expect("trace event parses from generated NOTA");
+            .expect("trace event parses from Datom");
         assert_eq!(parsed, events[4]);
     }
     assert_ne!(
-        *record_marker.state_digest.payload(),
-        0,
+        record_marker.state_digest, 0,
         "trace is attached to a real SEMA write, not a string-presence check"
     );
 }
@@ -159,14 +157,14 @@ fn authorization_trace_projects_to_spirit_authorization_event() {
     let projected = signal_introspect::ComponentTraceEvent::from(event);
 
     assert_eq!(
-        projected.component,
+        projected.introspection_target,
         signal_introspect::IntrospectionTarget::Spirit
     );
     assert_eq!(
-        projected.layer,
+        projected.trace_layer,
         signal_introspect::TraceLayer::Authorization
     );
-    assert_eq!(projected.event_name, "AuthorizationObserved");
+    assert_eq!(projected.trace_event_name, "AuthorizationObserved");
 }
 
 #[test]
@@ -207,10 +205,10 @@ fn testing_trace_builds_record_activations_by_default() {
     let sema = SemaFile::new();
     let mut engine = Engine::new(Store::open(&sema.path).expect("open sema store"));
 
-    let output = engine.handle(Input::record(record_request(entry(
+    let output = engine.handle(Query::Record(record_request(entry(
         "default trace witness",
     ))));
-    assert!(matches!(output.root(), Output::RecordAccepted(_)));
+    assert!(matches!(output.root(), Response::RecordAccepted(_)));
 
     assert_activation_names(
         &engine.trace_events(),
@@ -234,14 +232,16 @@ fn testing_trace_records_signal_rejection_without_nexus_or_sema_activations() {
     let mut engine = sema.engine_with_trace(trace_log.clone());
 
     let mut invalid_entry = entry("invalid trace witness");
-    invalid_entry.domains = Domains::new(vec![]);
+    invalid_entry.domains = vec![];
 
-    let output = engine.handle(Input::record(record_request(invalid_entry)));
+    let output = engine.handle(Query::Record(record_request(invalid_entry)));
 
     assert_eq!(engine.record_count(), 0);
     assert_eq!(
         output.root(),
-        &Output::rejected(SignalRejection::new(ValidationError::EmptyDomain))
+        &Response::Rejected(SignalRejection {
+            validation_error: ValidationError::EmptyDomain
+        })
     );
     assert_activation_names(&trace_log.events(), &["SignalRejected", "SignalReplied"]);
 }

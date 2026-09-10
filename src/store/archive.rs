@@ -70,11 +70,7 @@ impl ArchiveDatabase {
             .match_records(QueryPlan::all(self.entries))?
             .records()
             .to_vec();
-        records.sort_by(|left, right| {
-            left.record_identifier
-                .payload()
-                .cmp(right.record_identifier.payload())
-        });
+        records.sort_by(|left, right| left.record_identifier.cmp(&right.record_identifier));
         Ok(records)
     }
 }
