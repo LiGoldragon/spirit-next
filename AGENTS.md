@@ -1,5 +1,14 @@
 # spirit agent notes
 
+## Status: deprecated
+
+The living marked Spirit deprecated on 2026-09-10. Psyche is the intended
+replacement, re-authoring Spirit semantics from source evidence. Treat this
+repository as a legacy semantic donor, not an active development or stack
+migration target. Do not add new consumers or resume the unfinished migration
+without new explicit direction. The documentation below describes historical
+behavior and does not establish active status.
+
 Read this repo's `ARCHITECTURE.md` and `README.md` before editing code.
 
 `spirit` is the production Spirit daemon. It currently builds through the
@@ -28,6 +37,6 @@ Load-bearing rules for this repo:
 
 ## Protos estate status
 
-Stack: correct-new destination
-Status: active component, current checkout legacy-wired
-This checkout is not proof of correct-new adoption.
+Stack: deprecated legacy evidence
+Status: deprecated by the living on 2026-09-10
+This repository is not a destination for new-stack adoption.

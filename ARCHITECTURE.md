@@ -1,5 +1,14 @@
 # Spirit architecture
 
+## Status: deprecated
+
+The living marked Spirit deprecated on 2026-09-10. Psyche is the intended
+replacement, re-authoring Spirit semantics from source evidence. Treat this
+repository as a legacy semantic donor, not an active development or stack
+migration target. Do not add new consumers or resume the unfinished migration
+without new explicit direction. The documentation below describes historical
+behavior and does not establish active status.
+
 This document describes Spirit 0.27.0, storage schema 14, and signal wire
 revision 2.
 
